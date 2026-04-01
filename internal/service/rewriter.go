@@ -2,6 +2,7 @@ package service
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -103,7 +104,7 @@ func betaHeaderForModel(modelID string) string {
 
 // RewriteHeaders processes outgoing headers for anti-detection.
 // Removes hop-by-hop and auth headers, normalizes User-Agent and billing header.
-func (rw *Rewriter) RewriteHeaders(headers map[string]string, account *model.Account, clientType ClientType, modelID string) map[string]string {
+func (rw *Rewriter) RewriteHeaders(headers map[string]string, account *model.Account, clientType ClientType, modelID string, bodyMap map[string]any) map[string]string {
 	env := rw.parseEnv(account)
 	version := env.Version
 	if version == "" {
@@ -114,10 +115,9 @@ func (rw *Rewriter) RewriteHeaders(headers map[string]string, account *model.Acc
 
 	if clientType == ClientTypeAPI {
 		// API mode: use a fixed set of headers that match real Claude CLI.
-		// Do NOT forward any client headers — they come from browsers/third-party
-		// apps and contain detectable fingerprints (Sec-Ch-Ua, Sec-Fetch-*, etc.).
+		// Now that we inject system prompt, include claude-code beta.
 		out["Accept"] = "application/json"
-		out["User-Agent"] = fmt.Sprintf("claude-cli/%s (external, cli)", version)
+		out["User-Agent"] = fmt.Sprintf("claude-code/%s (external, cli)", version)
 		out["anthropic-beta"] = betaHeaderForModel(modelID)
 		out["anthropic-version"] = "2023-06-01"
 		out["anthropic-dangerous-direct-browser-access"] = "true"
@@ -133,6 +133,12 @@ func (rw *Rewriter) RewriteHeaders(headers map[string]string, account *model.Acc
 		out["X-Stainless-Runtime-Version"] = "v24.13.0"
 		out["X-Stainless-Retry-Count"] = "0"
 		out["X-Stainless-Timeout"] = "600"
+		// Use session_id from body metadata for consistency
+		sessionID := extractSessionIDFromBody(bodyMap)
+		if sessionID == "" {
+			sessionID = generateSessionUUID()
+		}
+		out["X-Claude-Code-Session-Id"] = sessionID
 	} else {
 		// CC client mode: whitelist + rewrite. The client already sends correct
 		// Claude CLI headers, just filter and normalize casing.
@@ -159,7 +165,7 @@ func (rw *Rewriter) RewriteHeaders(headers map[string]string, account *model.Acc
 			wireKey := resolveWireCasing(k)
 			switch lower {
 			case "user-agent":
-				out[wireKey] = fmt.Sprintf("claude-cli/%s (external, cli)", version)
+				out[wireKey] = fmt.Sprintf("claude-code/%s (external, cli)", version)
 			case "x-anthropic-billing-header":
 				out[wireKey] = rewriteBillingHeader(v, version)
 			default:
@@ -225,9 +231,43 @@ func (rw *Rewriter) rewriteMessages(body map[string]any, account *model.Account,
 		// Rewrite system prompt <env> block
 		rw.rewriteSystemPrompt(body, promptEnv, env.Version)
 	} else {
-		// Inject mode: add metadata.user_id if missing
-		rw.injectMetadataUserID(body, account)
-		// Don't touch system prompt for API calls
+		// Inject mode: transform pure API request to look exactly like Claude Code client.
+		// OAuth tokens are scoped to Claude Code — requests must match CC format precisely.
+
+		// 1. Inject metadata.user_id (CC always sends this)
+		sessionID := rw.injectMetadataUserID(body, account)
+		// Store sessionID for header consistency (caller retrieves via body)
+		if sessionID != "" {
+			if metadata, ok := body["metadata"].(map[string]any); ok {
+				metadata["_session_id"] = sessionID
+			}
+		}
+
+		// 2. Strip fields that Claude Code never sends
+		delete(body, "temperature")
+		delete(body, "top_k")
+		delete(body, "top_p")
+		delete(body, "stop_sequences")
+		delete(body, "tool_choice")
+
+		// 3. Ensure tools field exists (Claude Code always sends it, even empty)
+		if _, ok := body["tools"]; !ok {
+			body["tools"] = []any{}
+		}
+
+		// 4. Ensure stream is true (Claude Code always streams)
+		body["stream"] = true
+
+		// 5. Strip cache_control from system blocks (CC doesn't send this from API clients)
+		stripCacheControl(body)
+
+		// 6. Normalize max_tokens (CC uses specific values, not arbitrary large numbers)
+		if maxTokens, ok := body["max_tokens"].(float64); ok && maxTokens > 32768 {
+			body["max_tokens"] = float64(16384)
+		}
+
+		// 7. Inject Claude Code system prompt if not already present
+		rw.injectSystemPrompt(body)
 	}
 }
 
@@ -261,7 +301,8 @@ func (rw *Rewriter) rewriteMetadataUserID(body map[string]any, account *model.Ac
 }
 
 // injectMetadataUserID creates metadata.user_id for pure API calls.
-func (rw *Rewriter) injectMetadataUserID(body map[string]any, account *model.Account) {
+// Returns the session_id used so it can be reused in the X-Claude-Code-Session-Id header.
+func (rw *Rewriter) injectMetadataUserID(body map[string]any, account *model.Account) string {
 	metadata, ok := body["metadata"].(map[string]any)
 	if !ok {
 		metadata = make(map[string]any)
@@ -271,16 +312,90 @@ func (rw *Rewriter) injectMetadataUserID(body map[string]any, account *model.Acc
 	if _, exists := metadata["user_id"]; exists {
 		// Already has user_id, rewrite it instead
 		rw.rewriteMetadataUserID(body, account)
-		return
+		return ""
 	}
 
+	sessionID := generateSessionUUID()
+	// Derive account_uuid from account email via hashing (same approach as sub2api)
+	accountUUID := deriveAccountUUID(account)
 	uid := map[string]any{
 		"device_id":    account.DeviceID,
-		"account_uuid": "",
-		"session_id":   generateSessionUUID(),
+		"account_uuid": accountUUID,
+		"session_id":   sessionID,
 	}
 	uidBytes, _ := json.Marshal(uid)
 	metadata["user_id"] = string(uidBytes)
+	return sessionID
+}
+
+// deriveAccountUUID generates a stable UUID-like identifier from account info.
+func deriveAccountUUID(account *model.Account) string {
+	// Use email as seed if available, otherwise use account ID
+	seed := account.Email
+	if seed == "" {
+		seed = fmt.Sprintf("account-%d", account.ID)
+	}
+	h := sha256.Sum256([]byte(seed))
+	return fmt.Sprintf("%x-%x-%x-%x-%x", h[0:4], h[4:6], h[6:8], h[8:10], h[10:16])
+}
+
+// claudeCodeSystemPrompt is the canonical Claude Code banner.
+// Must match real Claude CLI traffic exactly.
+const claudeCodeSystemPrompt = "You are Claude Code, Anthropic's official CLI for Claude."
+
+// injectSystemPrompt prepends the Claude Code system prompt to the body
+// if it's not already present. For API mode (inject) only.
+func (rw *Rewriter) injectSystemPrompt(body map[string]any) {
+	// Check if system prompt already contains Claude Code banner
+	switch sys := body["system"].(type) {
+	case nil:
+		// No system field — inject as a single text block with cache_control
+		body["system"] = []any{
+			map[string]any{
+				"type": "text",
+				"text": claudeCodeSystemPrompt,
+				"cache_control": map[string]any{
+					"type": "ephemeral",
+				},
+			},
+		}
+	case string:
+		if strings.HasPrefix(sys, claudeCodeSystemPrompt) {
+			return // already present
+		}
+		// Prepend banner to existing string, wrap in array format
+		body["system"] = []any{
+			map[string]any{
+				"type": "text",
+				"text": claudeCodeSystemPrompt,
+				"cache_control": map[string]any{
+					"type": "ephemeral",
+				},
+			},
+			map[string]any{
+				"type": "text",
+				"text": sys,
+			},
+		}
+	case []any:
+		// Check if first block already has the banner
+		if len(sys) > 0 {
+			if block, ok := sys[0].(map[string]any); ok {
+				if text, ok := block["text"].(string); ok && strings.HasPrefix(text, claudeCodeSystemPrompt) {
+					return // already present
+				}
+			}
+		}
+		// Prepend banner block
+		bannerBlock := map[string]any{
+			"type": "text",
+			"text": claudeCodeSystemPrompt,
+			"cache_control": map[string]any{
+				"type": "ephemeral",
+			},
+		}
+		body["system"] = append([]any{bannerBlock}, sys...)
+	}
 }
 
 // --- System prompt rewriting (CC client mode only) ---
@@ -488,6 +603,34 @@ func rewriteAdditionalMetadata(encoded string) string {
 	return base64.StdEncoding.EncodeToString(out)
 }
 
+// stripCacheControl removes cache_control from system and message content blocks.
+// Claude Code clients manage caching server-side; pure API clients may send cache_control
+// which is not expected by the CC OAuth endpoint.
+func stripCacheControl(body map[string]any) {
+	// Strip from system blocks
+	if sys, ok := body["system"].([]any); ok {
+		for _, item := range sys {
+			if block, ok := item.(map[string]any); ok {
+				delete(block, "cache_control")
+			}
+		}
+	}
+	// Strip from message content blocks
+	if messages, ok := body["messages"].([]any); ok {
+		for _, msg := range messages {
+			if m, ok := msg.(map[string]any); ok {
+				if content, ok := m["content"].([]any); ok {
+					for _, item := range content {
+						if block, ok := item.(map[string]any); ok {
+							delete(block, "cache_control")
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
 // --- Helpers ---
 
 func (rw *Rewriter) parseEnv(account *model.Account) model.CanonicalEnvData {
@@ -513,6 +656,18 @@ func randomInRange(min, max int64) int64 {
 		return min
 	}
 	return min + mrand.Int64N(max-min)
+}
+
+// extractSessionIDFromBody retrieves the _session_id stashed during inject mode body rewrite.
+// This ensures the X-Claude-Code-Session-Id header matches the session_id in metadata.user_id.
+func extractSessionIDFromBody(body map[string]any) string {
+	if metadata, ok := body["metadata"].(map[string]any); ok {
+		if sid, ok := metadata["_session_id"].(string); ok {
+			delete(metadata, "_session_id") // clean up internal marker
+			return sid
+		}
+	}
+	return ""
 }
 
 func generateSessionUUID() string {

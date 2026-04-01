@@ -74,12 +74,30 @@ func (s *GatewayService) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	defer s.accountSvc.ReleaseSlot(ctx, account.ID)
 
 	// Rewrite body
+	logger.Debug("request body BEFORE rewrite: %s", truncateBody(bodyBytes, 4096))
 	rewrittenBody := s.rewriter.RewriteBody(bodyBytes, r.URL.Path, account, clientType)
+	logger.Debug("request body AFTER rewrite: %s", truncateBody(rewrittenBody, 4096))
+
+	// Re-parse rewritten body so headers can extract session_id for consistency
+	var rewrittenBodyMap map[string]any
+	if len(rewrittenBody) > 0 {
+		_ = json.Unmarshal(rewrittenBody, &rewrittenBodyMap)
+	}
+	if rewrittenBodyMap == nil {
+		rewrittenBodyMap = make(map[string]any)
+	}
 
 	// Rewrite headers
 	modelID, _ := bodyMap["model"].(string)
 	headers := extractHeaders(r)
-	rewrittenHeaders := s.rewriter.RewriteHeaders(headers, account, clientType, modelID)
+	rewrittenHeaders := s.rewriter.RewriteHeaders(headers, account, clientType, modelID, rewrittenBodyMap)
+
+	// Re-marshal body after header extraction (extractSessionIDFromBody cleans up _session_id)
+	if clientType == ClientTypeAPI {
+		if cleaned, err := json.Marshal(rewrittenBodyMap); err == nil {
+			rewrittenBody = cleaned
+		}
+	}
 	rewrittenHeaders["authorization"] = "Bearer " + account.Token
 
 	// Forward to upstream
@@ -124,6 +142,7 @@ func (s *GatewayService) forwardRequest(ctx context.Context, w http.ResponseWrit
 	}
 
 	client := s.proxyClient(account.ProxyURL)
+
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("[gateway] upstream error for account %d: %v", account.ID, err)
@@ -137,23 +156,39 @@ func (s *GatewayService) forwardRequest(ctx context.Context, w http.ResponseWrit
 		logger.Debug("upstream resp header: %s: %s", k, strings.Join(vs, ", "))
 	}
 
-	// Log error response bodies for debugging
-	if resp.StatusCode >= 400 && resp.StatusCode != 429 {
-		// For non-streaming error responses, peek at body
-		logger.Warn("upstream %d for account %d, path=%s", resp.StatusCode, account.ID, path)
+	// Log error response bodies for debugging (peek at body for non-streaming errors)
+	if resp.StatusCode >= 400 {
+		peekBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		logger.Warn("upstream %d for account %d, path=%s body=%s", resp.StatusCode, account.ID, path, string(peekBody))
+		// Reconstruct body so it can still be streamed to client
+		resp.Body = io.NopCloser(io.MultiReader(strings.NewReader(string(peekBody)), resp.Body))
 	}
 
-	// Handle rate limit
+	// Handle rate limit: only mark account as rate limited when upstream provides
+	// an explicit reset time. Transient 429s (no reset headers) are passed through
+	// without marking the account, matching sub2api behavior.
 	if resp.StatusCode == 429 {
 		retryAfter := resp.Header.Get("Retry-After")
-		resetAt := time.Now().Add(60 * time.Second)
+		rateLimitReset := resp.Header.Get("anthropic-ratelimit-requests-reset")
+		if rateLimitReset == "" {
+			rateLimitReset = resp.Header.Get("anthropic-ratelimit-tokens-reset")
+		}
+
 		if retryAfter != "" {
 			if d, err := time.ParseDuration(retryAfter + "s"); err == nil {
-				resetAt = time.Now().Add(d)
+				resetAt := time.Now().Add(d)
+				_ = s.accountSvc.SetRateLimit(ctx, account.ID, resetAt)
+				log.Printf("[gateway] account %d rate limited until %s (Retry-After)", account.ID, resetAt.Format(time.RFC3339))
 			}
+		} else if rateLimitReset != "" {
+			if resetAt, err := time.Parse(time.RFC3339, rateLimitReset); err == nil {
+				_ = s.accountSvc.SetRateLimit(ctx, account.ID, resetAt)
+				log.Printf("[gateway] account %d rate limited until %s (anthropic-ratelimit)", account.ID, resetAt.Format(time.RFC3339))
+			}
+		} else {
+			// No reset time — likely transient overload, do NOT mark account as rate limited
+			log.Printf("[gateway] account %d got 429 without reset headers, not marking rate limited", account.ID)
 		}
-		_ = s.accountSvc.SetRateLimit(ctx, account.ID, resetAt)
-		log.Printf("[gateway] account %d rate limited until %s", account.ID, resetAt.Format(time.RFC3339))
 	}
 
 	// Copy response headers
@@ -189,6 +224,13 @@ func (s *GatewayService) recordUsageFromBody(ctx context.Context, account *model
 		DurationMS: int(duration.Milliseconds()),
 		// Token counts will be extracted from SSE response in a future improvement
 	})
+}
+
+func truncateBody(b []byte, max int) string {
+	if len(b) > max {
+		return string(b[:max]) + "...(truncated)"
+	}
+	return string(b)
 }
 
 func (s *GatewayService) proxyClient(proxyURL string) *http.Client {
