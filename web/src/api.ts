@@ -30,6 +30,7 @@ export interface Account {
   token: string
   proxy_url: string
   device_id: string
+  billing_mode: string
   concurrency: number
   priority: number
   rate_limited_at?: string

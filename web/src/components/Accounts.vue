@@ -31,7 +31,7 @@ const deleteTargetId = ref<number | null>(null);
 /** 当前编辑的账号（null 表示新建） */
 const editing = ref<Account | null>(null);
 /** 表单数据 */
-const form = ref({ name: '', email: '', token: '', proxy_url: '', concurrency: 3, priority: 50 });
+const form = ref({ name: '', email: '', token: '', proxy_url: '', billing_mode: 'strip', concurrency: 3, priority: 50 });
 /** 正在测试的账号 ID */
 const testing = ref<number | null>(null);
 /** 测试结果 */
@@ -75,7 +75,7 @@ onMounted(load);
 /** 打开新建账号弹窗 */
 function openCreate() {
   editing.value = null;
-  form.value = { name: '', email: '', token: '', proxy_url: '', concurrency: 3, priority: 50 };
+  form.value = { name: '', email: '', token: '', proxy_url: '', billing_mode: 'strip', concurrency: 3, priority: 50 };
   showForm.value = true;
 }
 
@@ -90,6 +90,7 @@ function openEdit(a: Account) {
     email: a.email,
     token: '',
     proxy_url: a.proxy_url,
+    billing_mode: a.billing_mode || 'strip',
     concurrency: a.concurrency,
     priority: a.priority,
   };
@@ -105,6 +106,7 @@ async function save() {
       if (form.value.email) updates.email = form.value.email;
       if (form.value.token) updates.token = form.value.token;
       updates.proxy_url = form.value.proxy_url;
+      updates.billing_mode = form.value.billing_mode;
       updates.concurrency = form.value.concurrency;
       updates.priority = form.value.priority;
       await api.updateAccount(editing.value.id, updates);
@@ -265,7 +267,7 @@ function maskToken(t: string): string {
 
           <!-- 信息 -->
           <div class="pt-2 border-t border-[#f0ebe4] space-y-2">
-            <div class="grid grid-cols-2 gap-3">
+            <div class="grid grid-cols-3 gap-3">
               <div class="text-center">
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">并发</p>
                 <p class="text-sm font-medium text-[#29261e]">{{ a.concurrency }}</p>
@@ -273,6 +275,12 @@ function maskToken(t: string): string {
               <div class="text-center">
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">优先级</p>
                 <p class="text-sm font-medium text-[#29261e]">{{ a.priority }}</p>
+              </div>
+              <div class="text-center">
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">Billing</p>
+                <p class="text-sm font-medium" :class="a.billing_mode === 'rewrite' ? 'text-amber-600' : 'text-[#29261e]'">
+                  {{ a.billing_mode === 'rewrite' ? '重写' : '清除' }}
+                </p>
               </div>
             </div>
             <div class="space-y-3">
@@ -486,6 +494,31 @@ function maskToken(t: string): string {
               placeholder="http:// 或 socks5://"
               class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] placeholder-[#b5b0a6] focus:border-[#c4704f] focus:ring-[#c4704f]/20"
             />
+          </div>
+          <div class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">Billing 模式</Label>
+            <div class="flex gap-2">
+              <button
+                type="button"
+                @click="form.billing_mode = 'strip'"
+                class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                :class="form.billing_mode === 'strip'
+                  ? 'bg-[#c4704f]/10 border-[#c4704f] text-[#c4704f]'
+                  : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-[#c4704f]/40'"
+              >
+                清除 (Strip)
+              </button>
+              <button
+                type="button"
+                @click="form.billing_mode = 'rewrite'"
+                class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                :class="form.billing_mode === 'rewrite'
+                  ? 'bg-amber-50 border-amber-400 text-amber-600'
+                  : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-amber-300'"
+              >
+                重写 (Rewrite)
+              </button>
+            </div>
           </div>
           <div class="flex gap-4">
             <div class="flex-1 space-y-2">

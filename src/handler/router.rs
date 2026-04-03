@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::error::AppError;
-use crate::middleware::auth::{admin_auth, gateway_auth};
+use crate::middleware::auth::{admin_auth, extract_key};
 use crate::model::account::{Account, AccountStatus};
 use crate::model::api_token::{self, ApiToken};
 use crate::service::account::AccountService;
@@ -42,32 +42,19 @@ pub fn build_router(
         admin_password: cfg.admin.password.clone(),
     };
 
-    let token_store_for_gateway = state.token_store.clone();
-    let token_store_for_models = state.token_store.clone();
     let admin_password = state.admin_password.clone();
 
-    // 网关路由（令牌认证）
-    let gateway_routes = Router::new()
-        .route("/v1/messages", post(gateway_handler))
-        .route("/v1/messages/*rest", post(gateway_handler))
-        .route("/v1/*rest", post(gateway_handler).get(gateway_handler))
-        .route("/api/*rest", post(gateway_handler).get(gateway_handler))
-        .layer(middleware::from_fn(move |req, next: Next| {
-            let store = token_store_for_gateway.clone();
-            gateway_auth(store, req, next)
-        }))
-        .with_state(state.clone());
+    // 前端页面（显式注册 SPA 路由）
+    let frontend_routes = Router::new()
+        .route("/", get(spa_handler))
+        .route("/login", get(spa_handler))
+        .route("/tokens", get(spa_handler));
 
-    // 模型列表（令牌认证）
-    let models_route = Router::new()
-        .route("/v1/models", get(list_models))
-        .layer(middleware::from_fn(move |req, next: Next| {
-            let store = token_store_for_models.clone();
-            gateway_auth(store, req, next)
-        }))
-        .with_state(state.clone());
+    // 前端静态资源
+    let asset_routes = Router::new()
+        .route("/assets/*rest", get(asset_handler));
 
-    // 管理路由（密码认证）
+    // 管理 API（密码认证，完整路径注册）
     let admin_routes = Router::new()
         .route("/admin/accounts", get(list_accounts).post(create_account))
         .route(
@@ -88,35 +75,37 @@ pub fn build_router(
         }))
         .with_state(state.clone());
 
-    // 健康检查
-    let health = Router::new().route("/_health", get(health_handler));
-
-    // 组合所有路由
-    let mut app = Router::new()
-        .merge(health)
-        .merge(models_route)
+    // 组合路由：前端 + 管理 API + 其余全部透传网关
+    Router::new()
+        .merge(frontend_routes)
+        .merge(asset_routes)
         .merge(admin_routes)
-        .merge(gateway_routes);
-
-    // 前端静态资源（编译时嵌入二进制）
-    app = app.fallback(static_handler);
-
-    app
+        .fallback(gateway_fallback)
+        .with_state(state)
 }
 
 // --- Handlers ---
 
-async fn health_handler() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"status": "ok"}))
-}
-
-async fn gateway_handler(
+/// 网关透传 fallback：鉴权 + 代理上游
+async fn gateway_fallback(
     State(state): State<AppState>,
     req: Request,
 ) -> Response {
-    // 从请求扩展中取出已验证的 ApiToken
-    let api_token = req.extensions().get::<ApiToken>().cloned();
-    state.gateway_svc.handle_request(req, api_token.as_ref()).await
+    let key = extract_key(&req);
+    if key.is_empty() {
+        return err_json(StatusCode::UNAUTHORIZED, "missing api key");
+    }
+    let api_token = match state.token_store.get_by_token(&key).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return err_json(StatusCode::UNAUTHORIZED, "invalid api key"),
+        Err(_) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "authentication failed"),
+    };
+    state.gateway_svc.handle_request(req, Some(&api_token)).await
+}
+
+/// 统一 JSON 错误响应
+fn err_json(status: StatusCode, msg: &str) -> Response {
+    (status, Json(serde_json::json!({"error": msg}))).into_response()
 }
 
 // --- Account Handlers ---
@@ -357,7 +346,7 @@ async fn delete_token_handler(
     Ok(Json(serde_json::json!({"status": "deleted"})))
 }
 
-// --- Dashboard & Models ---
+// --- Dashboard ---
 
 async fn get_dashboard(
     State(state): State<AppState>,
@@ -387,37 +376,14 @@ async fn get_dashboard(
     })))
 }
 
-async fn list_models() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "data": [
-            {"id": "claude-opus-4-5-20251101", "type": "model", "display_name": "Claude Opus 4.5", "created_at": "2025-11-01T00:00:00Z"},
-            {"id": "claude-opus-4-6", "type": "model", "display_name": "Claude Opus 4.6", "created_at": "2026-02-06T00:00:00Z"},
-            {"id": "claude-sonnet-4-6", "type": "model", "display_name": "Claude Sonnet 4.6", "created_at": "2026-02-18T00:00:00Z"},
-            {"id": "claude-sonnet-4-5-20250929", "type": "model", "display_name": "Claude Sonnet 4.5", "created_at": "2025-09-29T00:00:00Z"},
-            {"id": "claude-haiku-4-5-20251001", "type": "model", "display_name": "Claude Haiku 4.5", "created_at": "2025-10-01T00:00:00Z"},
-        ],
-        "object": "list",
-    }))
-}
-
 // --- 内嵌前端静态资源 ---
 
 #[derive(Embed)]
 #[folder = "web/dist"]
 struct Assets;
 
-/// 根据请求路径返回内嵌的静态文件，未匹配则返回 index.html（SPA 路由）
-async fn static_handler(req: Request) -> impl IntoResponse {
-    let path = req.uri().path().trim_start_matches('/');
-    // 优先匹配静态文件
-    if let Some(file) = Assets::get(path) {
-        let mime = mime_from_path(path);
-        return Response::builder()
-            .header("content-type", mime)
-            .body(axum::body::Body::from(file.data.to_vec()))
-            .unwrap();
-    }
-    // SPA fallback: 返回 index.html
+/// SPA 页面：返回 index.html
+async fn spa_handler() -> impl IntoResponse {
     match Assets::get("index.html") {
         Some(index) => Response::builder()
             .header("content-type", "text/html")
@@ -428,6 +394,22 @@ async fn static_handler(req: Request) -> impl IntoResponse {
             .body(axum::body::Body::from("frontend not built"))
             .unwrap(),
     }
+}
+
+/// 前端静态资源：/assets/*
+async fn asset_handler(req: Request) -> impl IntoResponse {
+    let path = req.uri().path().trim_start_matches('/');
+    if let Some(file) = Assets::get(path) {
+        let mime = mime_from_path(path);
+        return Response::builder()
+            .header("content-type", mime)
+            .body(axum::body::Body::from(file.data.to_vec()))
+            .unwrap();
+    }
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(axum::body::Body::from("not found"))
+        .unwrap()
 }
 
 fn mime_from_path(path: &str) -> &'static str {

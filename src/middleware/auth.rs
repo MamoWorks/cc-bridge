@@ -8,7 +8,7 @@ use subtle::ConstantTimeEq;
 use crate::store::token_store::TokenStore;
 
 /// 从请求头提取 API Key（x-api-key 或 Authorization: Bearer）
-fn extract_key(req: &Request) -> String {
+pub fn extract_key(req: &Request) -> String {
     let headers = req.headers();
     headers
         .get("x-api-key")
