@@ -263,6 +263,21 @@ async function refreshUsage(id: number) {
 }
 
 /**
+ * 切换账号调度状态（启用/停用）
+ * @param a 账号对象
+ */
+async function toggleScheduling(a: Account) {
+  try {
+    const newStatus = a.status === 'disabled' ? 'active' : 'disabled';
+    await api.updateAccount(a.id, { status: newStatus });
+    a.status = newStatus;
+    emit('refresh');
+  } catch (e: unknown) {
+    toast((e as Error).message || '切换调度失败');
+  }
+}
+
+/**
  * 格式化剩余时间
  * @param resetsAt ISO 时间字符串
  */
@@ -357,6 +372,7 @@ function setAuthType(authType: 'setup_token' | 'oauth') {
         v-for="a in accounts"
         :key="a.id"
         class="bg-white border-[#e8e2d9] rounded-xl hover:shadow-md transition-all duration-200 overflow-hidden"
+        :class="a.status === 'disabled' ? 'opacity-60' : ''"
       >
         <div class="p-5 space-y-3">
           <!-- 头部：名称 + 状态 -->
@@ -483,6 +499,17 @@ function setAuthType(authType: 'setup_token' | 'oauth') {
 
           <!-- 操作按钮 -->
           <div class="flex items-center gap-2 pt-2 border-t border-[#f0ebe4]">
+            <Button
+              variant="ghost"
+              size="sm"
+              @click="toggleScheduling(a)"
+              :class="a.status === 'disabled'
+                ? 'text-emerald-500 hover:text-emerald-600 hover:bg-emerald-50'
+                : 'text-amber-500 hover:text-amber-600 hover:bg-amber-50'"
+              class="h-8 px-3 text-xs flex-1"
+            >
+              {{ a.status === 'disabled' ? '启用' : '停用' }}
+            </Button>
             <Button
               variant="ghost"
               size="sm"
