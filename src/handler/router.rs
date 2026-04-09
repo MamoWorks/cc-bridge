@@ -386,9 +386,15 @@ async fn refresh_usage(
 ) -> Result<Json<serde_json::Value>, AppError> {
     match state.account_svc.refresh_usage(id).await {
         Ok(usage) => Ok(Json(serde_json::json!({"status": "ok", "usage": usage}))),
-        Err(e) => Ok(Json(
-            serde_json::json!({"status": "error", "message": e.to_string()}),
-        )),
+        Err(e) => {
+            let message = match &e {
+                AppError::TooManyRequests(_) => "用量查询接口超限，请一分钟后再试".to_string(),
+                _ => e.to_string(),
+            };
+            Ok(Json(
+                serde_json::json!({"status": "error", "message": message}),
+            ))
+        }
     }
 }
 

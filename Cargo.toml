@@ -1,6 +1,6 @@
 [package]
 name = "claude-code-gateway"
-version = "1.5.2"
+version = "1.5.4"
 edition = "2024"
 
 [dependencies]
