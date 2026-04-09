@@ -471,11 +471,39 @@ function applyOAuthResult() {
   showForm.value = true;
 }
 
-/** 复制文本到剪贴板 */
+/** 复制文本到剪贴板（兼容非安全上下文） */
 async function copyText(text: string) {
+  if (!text) {
+    toast('没有可复制的内容');
+    return;
+  }
+
+  // 1. 优先使用 Clipboard API（仅在安全上下文 HTTPS / localhost 可用）
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('已复制');
+      return;
+    } catch {
+      // 失败则继续走降级方案
+    }
+  }
+
+  // 2. 降级方案：临时 textarea + execCommand('copy')
   try {
-    await navigator.clipboard.writeText(text);
-    toast('已复制');
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '0';
+    ta.style.left = '0';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    toast(ok ? '已复制' : '复制失败');
   } catch {
     toast('复制失败');
   }
