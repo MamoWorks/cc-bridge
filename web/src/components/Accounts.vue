@@ -157,6 +157,7 @@ function openEdit(a: Account) {
 async function save() {
   try {
     const expiresAt = form.value.expires_at.trim();
+    const normalizedExpiresAt = normalizeExpiresAtInput(expiresAt);
     if (editing.value) {
       if (form.value.auth_type === 'setup_token'
         && !form.value.setup_token.trim()
@@ -175,7 +176,7 @@ async function save() {
       if (form.value.setup_token) updates.setup_token = form.value.setup_token;
       if (form.value.access_token) updates.access_token = form.value.access_token;
       if (form.value.refresh_token) updates.refresh_token = form.value.refresh_token;
-      if (expiresAt) updates.expires_at = Number(expiresAt);
+      if (normalizedExpiresAt) updates.expires_at = normalizedExpiresAt;
       updates.proxy_url = form.value.proxy_url;
       updates.billing_mode = form.value.billing_mode;
       updates.account_uuid = form.value.account_uuid || null;
@@ -208,7 +209,7 @@ async function save() {
         priority: form.value.priority,
         auto_telemetry: form.value.auto_telemetry,
       };
-      if (expiresAt) payload.expires_at = Number(expiresAt);
+      if (normalizedExpiresAt) payload.expires_at = normalizedExpiresAt;
       await api.createAccount(payload);
     }
     showForm.value = false;
@@ -217,6 +218,24 @@ async function save() {
   } catch (e: unknown) {
     toast((e as Error).message || '保存失败');
   }
+}
+
+function normalizeExpiresAtInput(raw: string): string | null {
+  if (!raw) return null;
+
+  if (/^\d+$/.test(raw)) {
+    const date = new Date(Number(raw));
+    if (Number.isNaN(date.getTime())) {
+      throw new Error('expires_at 不是合法的毫秒时间戳');
+    }
+    return date.toISOString();
+  }
+
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error('expires_at 不是合法的时间格式');
+  }
+  return date.toISOString();
 }
 
 /**

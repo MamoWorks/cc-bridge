@@ -4,7 +4,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use chrono::TimeZone;
+use chrono::{DateTime, TimeZone, Utc};
 use rust_embed::Embed;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -179,7 +179,7 @@ struct CreateAccountRequest {
     auth_type: Option<String>,
     access_token: Option<String>,
     refresh_token: Option<String>,
-    expires_at: Option<i64>,
+    expires_at: Option<ClientDateTime>,
     proxy_url: Option<String>,
     billing_mode: Option<String>,
     account_uuid: Option<String>,
@@ -188,6 +188,13 @@ struct CreateAccountRequest {
     concurrency: Option<i32>,
     priority: Option<i32>,
     auto_telemetry: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ClientDateTime {
+    Millis(i64),
+    Text(String),
 }
 
 async fn create_account(
@@ -208,7 +215,7 @@ async fn create_account(
         setup_token,
         access_token: req.access_token.unwrap_or_default(),
         refresh_token: req.refresh_token.unwrap_or_default(),
-        expires_at: req.expires_at.and_then(timestamp_millis_to_utc),
+        expires_at: req.expires_at.as_ref().and_then(client_datetime_to_utc),
         oauth_refreshed_at: None,
         auth_error: String::new(),
         proxy_url: req.proxy_url.unwrap_or_default(),
@@ -281,10 +288,7 @@ async fn update_account(
         existing.refresh_token = refresh_token.to_string();
     }
     if updates.get("expires_at").is_some() {
-        existing.expires_at = updates
-            .get("expires_at")
-            .and_then(|v| v.as_i64())
-            .and_then(timestamp_millis_to_utc);
+        existing.expires_at = updates.get("expires_at").and_then(client_datetime_value_to_utc);
     }
     if let Some(proxy_url) = updates.get("proxy_url").and_then(|v| v.as_str()) {
         existing.proxy_url = proxy_url.to_string();
@@ -593,4 +597,63 @@ fn mime_from_path(path: &str) -> &'static str {
 
 fn timestamp_millis_to_utc(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::Utc.timestamp_millis_opt(ts).single()
+}
+
+fn client_datetime_to_utc(value: &ClientDateTime) -> Option<DateTime<Utc>> {
+    match value {
+        ClientDateTime::Millis(ts) => timestamp_millis_to_utc(*ts),
+        ClientDateTime::Text(text) => parse_client_datetime_str(text),
+    }
+}
+
+fn client_datetime_value_to_utc(value: &serde_json::Value) -> Option<DateTime<Utc>> {
+    match value {
+        serde_json::Value::Number(n) => n.as_i64().and_then(timestamp_millis_to_utc),
+        serde_json::Value::String(s) => parse_client_datetime_str(s),
+        _ => None,
+    }
+}
+
+fn parse_client_datetime_str(value: &str) -> Option<DateTime<Utc>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(ms) = trimmed.parse::<i64>() {
+        return timestamp_millis_to_utc(ms);
+    }
+    DateTime::parse_from_rfc3339(trimmed)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_client_datetime_millis_number() {
+        let parsed = client_datetime_value_to_utc(&serde_json::json!(1775737845123_i64)).unwrap();
+        assert_eq!(parsed.timestamp(), 1775737845);
+        assert_eq!(parsed.timestamp_subsec_millis(), 123);
+    }
+
+    #[test]
+    fn parses_client_datetime_millis_string() {
+        let parsed = client_datetime_value_to_utc(&serde_json::json!("1775737845123")).unwrap();
+        assert_eq!(parsed.timestamp(), 1775737845);
+        assert_eq!(parsed.timestamp_subsec_millis(), 123);
+    }
+
+    #[test]
+    fn parses_client_datetime_rfc3339_string() {
+        let parsed =
+            client_datetime_value_to_utc(&serde_json::json!("2026-04-09T12:30:45Z")).unwrap();
+        assert_eq!(parsed.timestamp(), 1775737845);
+    }
+
+    #[test]
+    fn empty_client_datetime_string_becomes_none() {
+        assert!(client_datetime_value_to_utc(&serde_json::json!("")).is_none());
+    }
 }

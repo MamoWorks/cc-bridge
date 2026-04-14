@@ -33,10 +33,32 @@ impl AccountStore {
         t.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     }
 
-    /// Returns `$N` for SQLite or `$N::TIMESTAMPTZ` for Postgres
-    fn ts(&self, n: u32) -> String {
+    /// Returns `$N::TEXT` for Postgres to work around sqlx Any driver encoding
+    /// all NULLs as `Option::<i32>::None` / INT4 type OID. The explicit `::TEXT`
+    /// cast makes the INT4→TEXT conversion succeed before assignment to a TEXT column.
+    fn nullable(&self, n: u32) -> String {
         if self.is_pg() {
-            format!("${}::TIMESTAMPTZ", n)
+            format!("${}::TEXT", n)
+        } else {
+            format!("${}", n)
+        }
+    }
+
+    /// Like `nullable()` but for TIMESTAMPTZ columns. Uses `$N::TEXT::TIMESTAMPTZ`
+    /// for Postgres because TEXT has no implicit assignment cast to TIMESTAMPTZ.
+    fn nullable_ts(&self, n: u32) -> String {
+        if self.is_pg() {
+            format!("${}::TEXT::TIMESTAMPTZ", n)
+        } else {
+            format!("${}", n)
+        }
+    }
+
+    /// Returns `$N::JSONB` for Postgres. The Any driver sends String as TEXT type,
+    /// but TEXT has no implicit assignment cast to JSONB.
+    fn jsonb(&self, n: u32) -> String {
+        if self.is_pg() {
+            format!("${}::JSONB", n)
         } else {
             format!("${}", n)
         }
@@ -181,11 +203,17 @@ impl AccountStore {
                 device_id, canonical_env, canonical_prompt_env, canonical_process,
                 billing_mode, account_uuid, organization_uuid, subscription_type,
                 concurrency, priority, auto_telemetry)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,{},{},{},$16,{},{},{},$20,$21,$22)
             RETURNING {}"#,
-            self.ts(9),
-            self.ts(10),
+            self.nullable_ts(9),
+            self.nullable_ts(10),
             "$11",
+            self.jsonb(13),
+            self.jsonb(14),
+            self.jsonb(15),
+            self.nullable(17),
+            self.nullable(18),
+            self.nullable(19),
             self.returning_account_timestamps()
         );
         let row: AnyRow = sqlx::query(&q)
@@ -228,11 +256,14 @@ impl AccountStore {
             r#"UPDATE accounts SET name=$1, email=$2, status=$3, token=$4,
                 auth_type=$5, access_token=$6, refresh_token=$7, oauth_expires_at={}, oauth_refreshed_at={},
                 auth_error=$10, proxy_url=$11, billing_mode=$12,
-                account_uuid=$13, organization_uuid=$14, subscription_type=$15,
+                account_uuid={}, organization_uuid={}, subscription_type={},
                 concurrency=$16, priority=$17, auto_telemetry=$18, updated_at={}
             WHERE id=$19"#,
-            self.ts(8),
-            self.ts(9),
+            self.nullable_ts(8),
+            self.nullable_ts(9),
+            self.nullable(13),
+            self.nullable(14),
+            self.nullable(15),
             self.now_expr()
         );
         sqlx::query(&q)
@@ -268,11 +299,9 @@ impl AccountStore {
         expires_at: DateTime<Utc>,
     ) -> Result<(), AppError> {
         let q = format!(
-            r#"UPDATE accounts SET access_token=$1, refresh_token=$2, oauth_expires_at={},
-                oauth_refreshed_at={}, auth_error='', updated_at={}
+            r#"UPDATE accounts SET access_token=$1, refresh_token=$2, oauth_expires_at=$3,
+                oauth_refreshed_at=$4, auth_error='', updated_at={}
             WHERE id=$5"#,
-            self.ts(3),
-            self.ts(4),
             self.now_expr()
         );
         sqlx::query(&q)
@@ -314,9 +343,7 @@ impl AccountStore {
 
     pub async fn set_rate_limit(&self, id: i64, reset_at: DateTime<Utc>) -> Result<(), AppError> {
         let q = format!(
-            "UPDATE accounts SET rate_limited_at={}, rate_limit_reset_at={}, updated_at={} WHERE id=$3",
-            self.ts(1),
-            self.ts(2),
+            "UPDATE accounts SET rate_limited_at=$1, rate_limit_reset_at=$2, updated_at={} WHERE id=$3",
             self.now_expr()
         );
         sqlx::query(&q)
@@ -339,8 +366,8 @@ impl AccountStore {
             r#"UPDATE accounts SET status=$1, disable_reason=$2,
                 rate_limited_at={}, rate_limit_reset_at={}, updated_at={}
             WHERE id=$5"#,
-            self.ts(3),
-            self.ts(4),
+            self.nullable_ts(3),
+            self.nullable_ts(4),
             self.now_expr()
         );
         let limited_str = rate_limit_reset_at.map(|_| self.fmt_time(Utc::now()));
@@ -429,8 +456,7 @@ impl AccountStore {
 
     pub async fn update_usage(&self, id: i64, usage_data: &str) -> Result<(), AppError> {
         let q = format!(
-            "UPDATE accounts SET usage_data=$1, usage_fetched_at={}, updated_at={} WHERE id=$3",
-            self.ts(2),
+            "UPDATE accounts SET usage_data=$1, usage_fetched_at=$2, updated_at={} WHERE id=$3",
             self.now_expr()
         );
         sqlx::query(&q)
@@ -502,22 +528,6 @@ mod tests {
             pool,
             driver: driver.to_string(),
         }
-    }
-
-    #[tokio::test]
-    async fn test_ts_sqlite_plain_placeholder() {
-        let store = make_store("sqlite").await;
-        assert_eq!(store.ts(1), "$1");
-        assert_eq!(store.ts(5), "$5");
-        assert_eq!(store.ts(10), "$10");
-    }
-
-    #[tokio::test]
-    async fn test_ts_postgres_casts_to_timestamptz() {
-        let store = make_store("postgres").await;
-        assert_eq!(store.ts(1), "$1::TIMESTAMPTZ");
-        assert_eq!(store.ts(5), "$5::TIMESTAMPTZ");
-        assert_eq!(store.ts(10), "$10::TIMESTAMPTZ");
     }
 
     #[tokio::test]
