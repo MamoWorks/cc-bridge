@@ -195,6 +195,51 @@ async fn test_update_usage_timestamp() {
     assert!(fetched.usage_fetched_at.is_some());
 }
 
+// ─── UPDATE_USAGE: JSON data stored and read back correctly ───
+
+#[tokio::test]
+async fn test_update_usage_stores_json_data() {
+    let store = setup().await;
+    let mut a = new_account("usage-json@example.com");
+    store.create(&mut a).await.unwrap();
+
+    let json_str = r#"{"tokens": 1000, "messages": 42}"#;
+    store
+        .update_usage(a.id, json_str)
+        .await
+        .expect("update_usage failed");
+
+    let fetched = store.get_by_id(a.id).await.unwrap();
+    assert_eq!(fetched.usage_data["tokens"], 1000);
+    assert_eq!(fetched.usage_data["messages"], 42);
+}
+
+#[tokio::test]
+async fn test_update_usage_overwrites_previous() {
+    let store = setup().await;
+    let mut a = new_account("usage-overwrite@example.com");
+    store.create(&mut a).await.unwrap();
+
+    store
+        .update_usage(a.id, r#"{"v": 1}"#)
+        .await
+        .expect("first update_usage failed");
+
+    let fetched1 = store.get_by_id(a.id).await.unwrap();
+    assert_eq!(fetched1.usage_data["v"], 1);
+
+    store
+        .update_usage(a.id, r#"{"v": 2, "extra": true}"#)
+        .await
+        .expect("second update_usage failed");
+
+    let fetched2 = store.get_by_id(a.id).await.unwrap();
+    assert_eq!(fetched2.usage_data["v"], 2);
+    assert_eq!(fetched2.usage_data["extra"], true);
+    // old key "v":1 should be gone
+    assert!(fetched2.usage_data.get("v").unwrap() == &serde_json::json!(2));
+}
+
 // ─── LIST_SCHEDULABLE: rate_limit_reset_at comparison ───
 
 #[tokio::test]

@@ -12,6 +12,9 @@ pub struct TokenStore {
 const TOKEN_COLS: &str =
     "id, name, token, allowed_accounts, blocked_accounts, status, created_at, updated_at";
 
+const TOKEN_COLS_PG_TEXT: &str =
+    "id, name, token, allowed_accounts, blocked_accounts, status, created_at::text AS created_at, updated_at::text AS updated_at";
+
 impl TokenStore {
     pub fn new(pool: AnyPool, driver: String) -> Self {
         Self { pool, driver }
@@ -25,27 +28,47 @@ impl TokenStore {
         }
     }
 
+    fn is_pg(&self) -> bool {
+        self.driver == "postgres"
+    }
+
+    fn select_token_cols(&self) -> &'static str {
+        if self.is_pg() {
+            TOKEN_COLS_PG_TEXT
+        } else {
+            TOKEN_COLS
+        }
+    }
+
     fn fmt_time(&self, t: DateTime<Utc>) -> String {
         t.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     }
 
     fn row_to_token(&self, row: &sqlx::any::AnyRow) -> ApiToken {
         use sqlx::Row;
+        let parse_time = |col: &str| -> DateTime<Utc> {
+            if let Ok(s) = row.try_get::<String, _>(col) {
+                s.parse().unwrap_or_else(|_| Utc::now())
+            } else {
+                Utc::now()
+            }
+        };
         ApiToken {
-            id: row.get::<i64, _>("id"),
-            name: row.get::<String, _>("name"),
-            token: row.get::<String, _>("token"),
-            allowed_accounts: row.get::<String, _>("allowed_accounts"),
-            blocked_accounts: row.get::<String, _>("blocked_accounts"),
-            status: row.get::<String, _>("status").into(),
-            created_at: row
-                .get::<String, _>("created_at")
-                .parse()
-                .unwrap_or_else(|_| Utc::now()),
-            updated_at: row
-                .get::<String, _>("updated_at")
-                .parse()
-                .unwrap_or_else(|_| Utc::now()),
+            id: row.try_get::<i64, _>("id").unwrap_or_default(),
+            name: row.try_get::<String, _>("name").unwrap_or_default(),
+            token: row.try_get::<String, _>("token").unwrap_or_default(),
+            allowed_accounts: row
+                .try_get::<String, _>("allowed_accounts")
+                .unwrap_or_default(),
+            blocked_accounts: row
+                .try_get::<String, _>("blocked_accounts")
+                .unwrap_or_default(),
+            status: row
+                .try_get::<String, _>("status")
+                .unwrap_or_else(|_| "active".into())
+                .into(),
+            created_at: parse_time("created_at"),
+            updated_at: parse_time("updated_at"),
         }
     }
 
@@ -96,7 +119,7 @@ impl TokenStore {
 
     /// 按 ID 查询
     pub async fn get_by_id(&self, id: i64) -> Result<ApiToken, AppError> {
-        let q = format!("SELECT {} FROM api_tokens WHERE id=$1", TOKEN_COLS);
+        let q = format!("SELECT {} FROM api_tokens WHERE id=$1", self.select_token_cols());
         let row = sqlx::query(&q)
             .bind(id)
             .fetch_optional(&self.pool)
@@ -109,7 +132,7 @@ impl TokenStore {
     pub async fn get_by_token(&self, token: &str) -> Result<Option<ApiToken>, AppError> {
         let q = format!(
             "SELECT {} FROM api_tokens WHERE token=$1 AND status='active'",
-            TOKEN_COLS
+            self.select_token_cols()
         );
         let row = sqlx::query(&q)
             .bind(token)
@@ -122,7 +145,7 @@ impl TokenStore {
     pub async fn list(&self) -> Result<Vec<ApiToken>, AppError> {
         let q = format!(
             "SELECT {} FROM api_tokens ORDER BY created_at DESC",
-            TOKEN_COLS
+            self.select_token_cols()
         );
         let rows = sqlx::query(&q).fetch_all(&self.pool).await?;
         Ok(rows.iter().map(|r| self.row_to_token(r)).collect())
@@ -133,7 +156,7 @@ impl TokenStore {
         let offset = (page - 1) * page_size;
         let q = format!(
             "SELECT {} FROM api_tokens ORDER BY created_at DESC LIMIT $1 OFFSET $2",
-            TOKEN_COLS
+            self.select_token_cols()
         );
         let rows = sqlx::query(&q)
             .bind(page_size)

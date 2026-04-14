@@ -299,9 +299,11 @@ impl AccountStore {
         expires_at: DateTime<Utc>,
     ) -> Result<(), AppError> {
         let q = format!(
-            r#"UPDATE accounts SET access_token=$1, refresh_token=$2, oauth_expires_at=$3,
-                oauth_refreshed_at=$4, auth_error='', updated_at={}
+            r#"UPDATE accounts SET access_token=$1, refresh_token=$2, oauth_expires_at={},
+                oauth_refreshed_at={}, auth_error='', updated_at={}
             WHERE id=$5"#,
+            self.nullable_ts(3),
+            self.nullable_ts(4),
             self.now_expr()
         );
         sqlx::query(&q)
@@ -343,7 +345,9 @@ impl AccountStore {
 
     pub async fn set_rate_limit(&self, id: i64, reset_at: DateTime<Utc>) -> Result<(), AppError> {
         let q = format!(
-            "UPDATE accounts SET rate_limited_at=$1, rate_limit_reset_at=$2, updated_at={} WHERE id=$3",
+            "UPDATE accounts SET rate_limited_at={}, rate_limit_reset_at={}, updated_at={} WHERE id=$3",
+            self.nullable_ts(1),
+            self.nullable_ts(2),
             self.now_expr()
         );
         sqlx::query(&q)
@@ -456,7 +460,9 @@ impl AccountStore {
 
     pub async fn update_usage(&self, id: i64, usage_data: &str) -> Result<(), AppError> {
         let q = format!(
-            "UPDATE accounts SET usage_data=$1, usage_fetched_at=$2, updated_at={} WHERE id=$3",
+            "UPDATE accounts SET usage_data={}, usage_fetched_at={}, updated_at={} WHERE id=$3",
+            self.jsonb(1),
+            self.nullable_ts(2),
             self.now_expr()
         );
         sqlx::query(&q)
@@ -582,5 +588,61 @@ mod tests {
         let parsed = AccountStore::parse_datetime_str("2026-04-09 12:30:45.123456+00:00").unwrap();
         assert_eq!(parsed.timestamp(), 1775737845);
         assert_eq!(parsed.timestamp_subsec_micros(), 123456);
+    }
+
+    // ─── nullable_ts() helper ───
+
+    #[tokio::test]
+    async fn test_nullable_ts_sqlite() {
+        let store = make_store("sqlite").await;
+        assert_eq!(store.nullable_ts(3), "$3");
+    }
+
+    #[tokio::test]
+    async fn test_nullable_ts_postgres() {
+        let store = make_store("postgres").await;
+        assert_eq!(store.nullable_ts(3), "$3::TEXT::TIMESTAMPTZ");
+    }
+
+    // ─── jsonb() helper ───
+
+    #[tokio::test]
+    async fn test_jsonb_sqlite() {
+        let store = make_store("sqlite").await;
+        assert_eq!(store.jsonb(1), "$1");
+    }
+
+    #[tokio::test]
+    async fn test_jsonb_postgres() {
+        let store = make_store("postgres").await;
+        assert_eq!(store.jsonb(1), "$1::JSONB");
+    }
+
+    // ─── nullable() helper ───
+
+    #[tokio::test]
+    async fn test_nullable_sqlite() {
+        let store = make_store("sqlite").await;
+        assert_eq!(store.nullable(5), "$5");
+    }
+
+    #[tokio::test]
+    async fn test_nullable_postgres() {
+        let store = make_store("postgres").await;
+        assert_eq!(store.nullable(5), "$5::TEXT");
+    }
+
+    // ─── select_account_cols() ───
+
+    #[tokio::test]
+    async fn test_select_account_cols_sqlite() {
+        let store = make_store("sqlite").await;
+        assert_eq!(store.select_account_cols(), ACCOUNT_COLS);
+    }
+
+    #[tokio::test]
+    async fn test_select_account_cols_postgres() {
+        let store = make_store("postgres").await;
+        assert_eq!(store.select_account_cols(), ACCOUNT_COLS_PG_TEXT);
     }
 }
