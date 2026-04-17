@@ -8,8 +8,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use rust_embed::Embed;
 use serde::Deserialize;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
-use crate::config::Config;
+use crate::config::{Config, WarmupConfig};
 use crate::error::AppError;
 use crate::middleware::auth::{admin_auth, extract_key};
 use crate::model::account::{Account, AccountAuthType, AccountStatus};
@@ -19,6 +20,7 @@ use crate::service::gateway::GatewayService;
 use crate::service::oauth::TokenTester;
 use crate::service::oauth_flow::OAuthFlowService;
 use crate::service::telemetry::TelemetryService;
+use crate::store::settings_store::SettingsStore;
 use crate::store::token_store::TokenStore;
 
 #[derive(Clone)]
@@ -29,6 +31,8 @@ pub struct AppState {
     pub token_store: Arc<TokenStore>,
     pub oauth_flow_svc: Arc<OAuthFlowService>,
     pub telemetry_svc: Arc<TelemetryService>,
+    pub settings_store: Arc<SettingsStore>,
+    pub warmup_defaults: WarmupConfig,
     pub admin_password: String,
 }
 
@@ -40,6 +44,7 @@ pub fn build_router(
     token_store: Arc<TokenStore>,
     oauth_flow_svc: Arc<OAuthFlowService>,
     telemetry_svc: Arc<TelemetryService>,
+    settings_store: Arc<SettingsStore>,
 ) -> Router {
     let state = AppState {
         gateway_svc,
@@ -48,6 +53,8 @@ pub fn build_router(
         token_store,
         oauth_flow_svc,
         telemetry_svc,
+        settings_store,
+        warmup_defaults: cfg.warmup.clone(),
         admin_password: cfg.admin.password.clone(),
     };
 
@@ -79,6 +86,7 @@ pub fn build_router(
             put(update_token).delete(delete_token_handler),
         )
         .route("/admin/dashboard", get(get_dashboard))
+        .route("/admin/settings", get(get_settings).put(update_settings))
         .route(
             "/admin/oauth/generate-auth-url",
             post(oauth_generate_auth_url),
@@ -188,6 +196,7 @@ struct CreateAccountRequest {
     concurrency: Option<i32>,
     priority: Option<i32>,
     auto_telemetry: Option<bool>,
+    warmup_enabled: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -234,6 +243,12 @@ async fn create_account(
         disable_reason: String::new(),
         auto_telemetry: req.auto_telemetry.unwrap_or(false),
         telemetry_count: 0,
+        warmup_enabled: req.warmup_enabled.unwrap_or(false),
+        next_warmup_at: None,
+        last_warmup_at: None,
+        last_warmup_status: String::new(),
+        last_warmup_message: String::new(),
+        warmup_retry_count: 0,
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
         created_at: chrono::Utc::now(),
@@ -243,12 +258,116 @@ async fn create_account(
     Ok((StatusCode::CREATED, Json(account)))
 }
 
+async fn get_settings(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
+    let quarantine_on_429 = state.gateway_svc.quarantine_on_429.load(Ordering::Relaxed);
+    let warmup_settings = load_warmup_settings(&state).await;
+    Ok(Json(
+        serde_json::json!({
+            "quarantine_on_429": quarantine_on_429,
+            "warmup_enabled": warmup_settings.enabled,
+            "warmup_base_utc_hour": warmup_settings.base_utc_hour,
+            "warmup_jitter_minutes": warmup_settings.jitter_minutes,
+            "warmup_max_retries": warmup_settings.max_retries,
+            "warmup_retry_backoff_secs": warmup_settings.retry_backoff_secs,
+            "warmup_account_gap_secs": warmup_settings.account_gap_secs,
+            "warmup_poll_interval_secs": warmup_settings.poll_interval_secs,
+        }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct UpdateSettingsRequest {
+    quarantine_on_429: Option<bool>,
+    warmup_enabled: Option<bool>,
+    warmup_base_utc_hour: Option<u32>,
+    warmup_jitter_minutes: Option<i64>,
+    warmup_max_retries: Option<u32>,
+    warmup_retry_backoff_secs: Option<u64>,
+    warmup_account_gap_secs: Option<u64>,
+    warmup_poll_interval_secs: Option<u64>,
+}
+
+async fn update_settings(
+    State(state): State<AppState>,
+    Json(req): Json<UpdateSettingsRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if let Some(val) = req.quarantine_on_429 {
+        state
+            .gateway_svc
+            .quarantine_on_429
+            .store(val, Ordering::Relaxed);
+        state
+            .settings_store
+            .set("quarantine_on_429", if val { "true" } else { "false" })
+            .await?;
+    }
+
+    if let Some(val) = req.warmup_enabled {
+        state
+            .settings_store
+            .set("warmup_enabled", if val { "true" } else { "false" })
+            .await?;
+    }
+    if let Some(hour) = req.warmup_base_utc_hour {
+        state
+            .settings_store
+            .set("warmup_base_utc_hour", &hour.min(23).to_string())
+            .await?;
+    }
+    if let Some(minutes) = req.warmup_jitter_minutes {
+        state
+            .settings_store
+            .set("warmup_jitter_minutes", &minutes.clamp(0, 720).to_string())
+            .await?;
+    }
+    if let Some(retries) = req.warmup_max_retries {
+        state
+            .settings_store
+            .set("warmup_max_retries", &retries.min(10).to_string())
+            .await?;
+    }
+    if let Some(secs) = req.warmup_retry_backoff_secs {
+        state
+            .settings_store
+            .set("warmup_retry_backoff_secs", &secs.max(30).to_string())
+            .await?;
+    }
+    if let Some(secs) = req.warmup_account_gap_secs {
+        state
+            .settings_store
+            .set("warmup_account_gap_secs", &secs.max(1).to_string())
+            .await?;
+    }
+    if let Some(secs) = req.warmup_poll_interval_secs {
+        state
+            .settings_store
+            .set("warmup_poll_interval_secs", &secs.max(15).to_string())
+            .await?;
+    }
+
+    let quarantine_on_429 = state.gateway_svc.quarantine_on_429.load(Ordering::Relaxed);
+    let warmup_settings = load_warmup_settings(&state).await;
+    Ok(Json(
+        serde_json::json!({
+            "quarantine_on_429": quarantine_on_429,
+            "warmup_enabled": warmup_settings.enabled,
+            "warmup_base_utc_hour": warmup_settings.base_utc_hour,
+            "warmup_jitter_minutes": warmup_settings.jitter_minutes,
+            "warmup_max_retries": warmup_settings.max_retries,
+            "warmup_retry_backoff_secs": warmup_settings.retry_backoff_secs,
+            "warmup_account_gap_secs": warmup_settings.account_gap_secs,
+            "warmup_poll_interval_secs": warmup_settings.poll_interval_secs,
+        }),
+    ))
+}
+
 async fn update_account(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(updates): Json<serde_json::Value>,
 ) -> Result<Json<Account>, AppError> {
     let mut existing = state.account_svc.get_account(id).await?;
+    let mut clear_warmup_state = false;
 
     if let Some(name) = updates.get("name").and_then(|v| v.as_str()) {
         if !name.is_empty() {
@@ -288,7 +407,9 @@ async fn update_account(
         existing.refresh_token = refresh_token.to_string();
     }
     if updates.get("expires_at").is_some() {
-        existing.expires_at = updates.get("expires_at").and_then(client_datetime_value_to_utc);
+        existing.expires_at = updates
+            .get("expires_at")
+            .and_then(client_datetime_value_to_utc);
     }
     if let Some(proxy_url) = updates.get("proxy_url").and_then(|v| v.as_str()) {
         existing.proxy_url = proxy_url.to_string();
@@ -347,8 +468,22 @@ async fn update_account(
     if let Some(auto_telemetry) = updates.get("auto_telemetry").and_then(|v| v.as_bool()) {
         existing.auto_telemetry = auto_telemetry;
     }
+    if let Some(warmup_enabled) = updates.get("warmup_enabled").and_then(|v| v.as_bool()) {
+        existing.warmup_enabled = warmup_enabled;
+        if !warmup_enabled {
+            existing.next_warmup_at = None;
+            existing.warmup_retry_count = 0;
+            clear_warmup_state = true;
+        }
+    }
 
     state.account_svc.update_account(&existing).await?;
+    if clear_warmup_state {
+        state
+            .account_svc
+            .clear_warmup_state(id)
+            .await?;
+    }
     Ok(Json(existing))
 }
 
@@ -625,6 +760,47 @@ fn parse_client_datetime_str(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(trimmed)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+async fn load_warmup_settings(state: &AppState) -> crate::service::warmup_scheduler::WarmupSettings {
+    let mut settings =
+        crate::service::warmup_scheduler::WarmupSettings::from_defaults(&state.warmup_defaults);
+
+    if let Ok(Some(value)) = state.settings_store.get("warmup_enabled").await {
+        settings.enabled = value != "false";
+    }
+    if let Ok(Some(value)) = state.settings_store.get("warmup_base_utc_hour").await {
+        if let Ok(hour) = value.parse::<u32>() {
+            settings.base_utc_hour = hour.min(23);
+        }
+    }
+    if let Ok(Some(value)) = state.settings_store.get("warmup_jitter_minutes").await {
+        if let Ok(minutes) = value.parse::<i64>() {
+            settings.jitter_minutes = minutes.clamp(0, 720);
+        }
+    }
+    if let Ok(Some(value)) = state.settings_store.get("warmup_max_retries").await {
+        if let Ok(retries) = value.parse::<u32>() {
+            settings.max_retries = retries.min(10);
+        }
+    }
+    if let Ok(Some(value)) = state.settings_store.get("warmup_retry_backoff_secs").await {
+        if let Ok(secs) = value.parse::<u64>() {
+            settings.retry_backoff_secs = secs.max(30);
+        }
+    }
+    if let Ok(Some(value)) = state.settings_store.get("warmup_account_gap_secs").await {
+        if let Ok(secs) = value.parse::<u64>() {
+            settings.account_gap_secs = secs.max(1);
+        }
+    }
+    if let Ok(Some(value)) = state.settings_store.get("warmup_poll_interval_secs").await {
+        if let Ok(secs) = value.parse::<u64>() {
+            settings.poll_interval_secs = secs.max(15);
+        }
+    }
+
+    settings
 }
 
 #[cfg(test)]

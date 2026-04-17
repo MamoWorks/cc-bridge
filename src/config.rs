@@ -10,6 +10,7 @@ pub struct Config {
     pub admin: AdminConfig,
     pub log_level: String,
     pub usage_poll_interval: Duration,
+    pub warmup: WarmupConfig,
 }
 
 #[derive(Clone)]
@@ -42,6 +43,18 @@ pub struct RedisConfig {
 #[derive(Clone)]
 pub struct AdminConfig {
     pub password: String,
+}
+
+#[derive(Clone)]
+pub struct WarmupConfig {
+    pub enabled: bool,
+    pub base_utc_hour: u32,
+    pub jitter_minutes: i64,
+    pub max_retries: u32,
+    pub retry_backoff_secs: u64,
+    pub account_gap_secs: u64,
+    pub poll_interval_secs: u64,
+    pub greetings_file: String,
 }
 
 impl DatabaseConfig {
@@ -134,6 +147,41 @@ impl Config {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(300),
             ),
+            warmup: WarmupConfig {
+                enabled: env::var("WARMUP_ENABLED")
+                    .ok()
+                    .map(|v| v != "false")
+                    .unwrap_or(false),
+                base_utc_hour: env::var("WARMUP_UTC_HOUR")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .map(|v| v.min(23))
+                    .unwrap_or(23),
+                jitter_minutes: env::var("WARMUP_JITTER_MINUTES")
+                    .ok()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .map(|v| v.clamp(0, 720))
+                    .unwrap_or(30),
+                max_retries: env::var("WARMUP_MAX_RETRIES")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .map(|v| v.min(10))
+                    .unwrap_or(2),
+                retry_backoff_secs: env::var("WARMUP_RETRY_BACKOFF_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(300),
+                account_gap_secs: env::var("WARMUP_ACCOUNT_GAP_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(45),
+                poll_interval_secs: env::var("WARMUP_POLL_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(60),
+                greetings_file: env::var("WARMUP_GREETINGS_FILE")
+                    .unwrap_or_else(|_| "data/warmup_greetings.txt".into()),
+            },
         }
     }
 }

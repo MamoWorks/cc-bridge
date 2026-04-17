@@ -52,6 +52,12 @@ export interface Account {
   priority: number
   auto_telemetry: boolean
   telemetry_count: number
+  warmup_enabled: boolean
+  next_warmup_at?: string
+  last_warmup_at?: string
+  last_warmup_status?: string
+  last_warmup_message?: string
+  warmup_retry_count: number
   telemetry_expires_at?: string
   rate_limited_at?: string
   rate_limit_reset_at?: string
@@ -97,6 +103,17 @@ export interface Dashboard {
   tokens: number;
 }
 
+export interface Settings {
+  quarantine_on_429: boolean
+  warmup_enabled: boolean
+  warmup_base_utc_hour: number
+  warmup_jitter_minutes: number
+  warmup_max_retries: number
+  warmup_retry_backoff_secs: number
+  warmup_account_gap_secs: number
+  warmup_poll_interval_secs: number
+}
+
 export interface OAuthGenerateResult {
   auth_url: string;
   session_id: string;
@@ -136,4 +153,7 @@ export const api = {
     request<OAuthExchangeResult>('POST', '/admin/oauth/exchange-code', { session_id: sessionId, code }),
   exchangeSetupTokenCode: (sessionId: string, code: string) =>
     request<OAuthExchangeResult>('POST', '/admin/oauth/exchange-setup-token-code', { session_id: sessionId, code }),
+  getSettings: () => request<Settings>('GET', '/admin/settings'),
+  updateSettings: (s: Partial<Settings>) =>
+    request<Settings>('PUT', '/admin/settings', s),
 }

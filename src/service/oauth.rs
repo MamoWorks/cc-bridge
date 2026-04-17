@@ -46,6 +46,17 @@ impl TokenTester {
         proxy_url: &str,
         canonical_env: &Value,
     ) -> Result<(), AppError> {
+        self.test_token_with_message(token, proxy_url, canonical_env, "hi")
+            .await
+    }
+
+    pub async fn test_token_with_message(
+        &self,
+        token: &str,
+        proxy_url: &str,
+        canonical_env: &Value,
+        message: &str,
+    ) -> Result<(), AppError> {
         let env: CanonicalEnvData =
             serde_json::from_value(canonical_env.clone()).unwrap_or_default();
         let version = if env.version.is_empty() {
@@ -62,7 +73,7 @@ impl TokenTester {
         let body = serde_json::json!({
             "model": "claude-haiku-4-5-20251001",
             "max_tokens": 1,
-            "messages": [{"role": "user", "content": "hi"}]
+            "messages": [{"role": "user", "content": message}]
         });
 
         let client = make_request_client(proxy_url);
@@ -73,9 +84,15 @@ impl TokenTester {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05")
+            .header(
+                "anthropic-beta",
+                "oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05",
+            )
             .header("anthropic-dangerous-direct-browser-access", "true")
-            .header("User-Agent", format!("claude-cli/{} (external, cli)", version))
+            .header(
+                "User-Agent",
+                format!("claude-cli/{} (external, cli)", version),
+            )
             .header("x-app", "cli")
             .header("accept-encoding", "gzip, deflate, br, zstd")
             .header("X-Stainless-Lang", "js")

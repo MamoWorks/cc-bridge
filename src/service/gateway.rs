@@ -7,6 +7,7 @@ use futures_core::Stream;
 use pin_project_lite::pin_project;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tracing::{debug, warn};
 
@@ -88,6 +89,7 @@ pub struct GatewayService {
     account_svc: Arc<AccountService>,
     rewriter: Arc<Rewriter>,
     telemetry_svc: Arc<TelemetryService>,
+    pub quarantine_on_429: Arc<AtomicBool>,
 }
 
 impl GatewayService {
@@ -95,11 +97,13 @@ impl GatewayService {
         account_svc: Arc<AccountService>,
         rewriter: Arc<Rewriter>,
         telemetry_svc: Arc<TelemetryService>,
+        quarantine_on_429: Arc<AtomicBool>,
     ) -> Self {
         Self {
             account_svc,
             rewriter,
             telemetry_svc,
+            quarantine_on_429,
         }
     }
 
@@ -347,7 +351,7 @@ impl GatewayService {
         // 处理限速：429 根据账号类型分别处理
         // - SetupToken: 保守 5h 限流
         // - OAuth: 查用量判断是撞墙（5h / 7d）还是纯 rate limit，分别设置限流时长
-        if status_code == 429 {
+        if status_code == 429 && self.quarantine_on_429.load(Ordering::Relaxed) {
             if let Err(e) = self.account_svc.handle_rate_limit(account).await {
                 warn!(
                     "failed to handle rate limit for account {}: {}",

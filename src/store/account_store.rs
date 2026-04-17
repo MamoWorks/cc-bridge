@@ -74,14 +74,7 @@ impl AccountStore {
                     .ok()
             })
             .or_else(|| {
-                // PG TIMESTAMPTZ::text 完整格式: "2026-04-16 12:30:45.123456+08:00"
                 DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%:z")
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .ok()
-            })
-            .or_else(|| {
-                // PG TIMESTAMPTZ::text 短时区格式: "2026-04-16 12:30:45+08"
-                DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%#z")
                     .map(|dt| dt.with_timezone(&Utc))
                     .ok()
             })
@@ -116,14 +109,6 @@ impl AccountStore {
             ACCOUNT_COLS_PG_TEXT
         } else {
             ACCOUNT_COLS
-        }
-    }
-
-    fn returning_account_timestamps(&self) -> &'static str {
-        if self.is_pg() {
-            "id, created_at::text AS created_at, updated_at::text AS updated_at"
-        } else {
-            "id, created_at, updated_at"
         }
     }
 
@@ -175,6 +160,16 @@ impl AccountStore {
                 .unwrap_or_default(),
             auto_telemetry: row.try_get::<i32, _>("auto_telemetry").unwrap_or(0) != 0,
             telemetry_count: row.try_get::<i64, _>("telemetry_count").unwrap_or(0),
+            warmup_enabled: row.try_get::<i32, _>("warmup_enabled").unwrap_or(0) != 0,
+            next_warmup_at: Self::parse_optional_time(row, "next_warmup_at"),
+            last_warmup_at: Self::parse_optional_time(row, "last_warmup_at"),
+            last_warmup_status: row
+                .try_get::<String, _>("last_warmup_status")
+                .unwrap_or_default(),
+            last_warmup_message: row
+                .try_get::<String, _>("last_warmup_message")
+                .unwrap_or_default(),
+            warmup_retry_count: row.try_get::<i32, _>("warmup_retry_count").unwrap_or(0),
             usage_data: Self::parse_json(row, "usage_data"),
             usage_fetched_at: Self::parse_optional_time(row, "usage_fetched_at"),
             created_at: Self::parse_time(row, "created_at"),
@@ -209,9 +204,8 @@ impl AccountStore {
                 auth_type, access_token, refresh_token, oauth_expires_at, oauth_refreshed_at, auth_error,
                 device_id, canonical_env, canonical_prompt_env, canonical_process,
                 billing_mode, account_uuid, organization_uuid, subscription_type,
-                concurrency, priority, auto_telemetry)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,{},{},{},$16,{},{},{},$20,$21,$22)
-            RETURNING {}"#,
+                concurrency, priority, auto_telemetry, warmup_enabled)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,{},{},{},$16,{},{},{},$20,$21,$22,$23)"#,
             self.nullable_ts(9),
             self.nullable_ts(10),
             "$11",
@@ -220,10 +214,9 @@ impl AccountStore {
             self.jsonb(15),
             self.nullable(17),
             self.nullable(18),
-            self.nullable(19),
-            self.returning_account_timestamps()
+            self.nullable(19)
         );
-        let row: AnyRow = sqlx::query(&q)
+        sqlx::query(&q)
             .bind(&a.name)
             .bind(&a.email)
             .bind(a.status.to_string())
@@ -246,8 +239,17 @@ impl AccountStore {
             .bind(a.concurrency)
             .bind(a.priority)
             .bind(auto_telemetry_int)
-            .fetch_one(&self.pool)
+            .bind(if a.warmup_enabled { 1 } else { 0 })
+            .execute(&self.pool)
             .await?;
+
+        let row: AnyRow = sqlx::query(&format!(
+            "SELECT {} FROM accounts WHERE email=$1",
+            self.select_account_cols()
+        ))
+        .bind(&a.email)
+        .fetch_one(&self.pool)
+        .await?;
 
         a.id = row.try_get::<i64, _>("id").unwrap_or_default();
         a.created_at = Self::parse_time(&row, "created_at");
@@ -264,8 +266,8 @@ impl AccountStore {
                 auth_type=$5, access_token=$6, refresh_token=$7, oauth_expires_at={}, oauth_refreshed_at={},
                 auth_error=$10, proxy_url=$11, billing_mode=$12,
                 account_uuid={}, organization_uuid={}, subscription_type={},
-                concurrency=$16, priority=$17, auto_telemetry=$18, updated_at={}
-            WHERE id=$19"#,
+                concurrency=$16, priority=$17, auto_telemetry=$18, warmup_enabled=$19, updated_at={}
+            WHERE id=$20"#,
             self.nullable_ts(8),
             self.nullable_ts(9),
             self.nullable(13),
@@ -292,9 +294,47 @@ impl AccountStore {
             .bind(a.concurrency)
             .bind(a.priority)
             .bind(auto_telemetry_int)
+            .bind(if a.warmup_enabled { 1 } else { 0 })
             .bind(a.id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    pub async fn update_warmup_state(
+        &self,
+        id: i64,
+        next_warmup_at: Option<DateTime<Utc>>,
+        last_warmup_at: Option<DateTime<Utc>>,
+        last_warmup_status: &str,
+        last_warmup_message: &str,
+        warmup_retry_count: i32,
+    ) -> Result<(), AppError> {
+        let q = format!(
+            "UPDATE accounts SET next_warmup_at={}, last_warmup_at={}, last_warmup_status=$3, \
+             last_warmup_message=$4, warmup_retry_count=$5, updated_at={} WHERE id=$6",
+            self.nullable_ts(1),
+            self.nullable_ts(2),
+            self.now_expr()
+        );
+        sqlx::query(&q)
+            .bind(next_warmup_at.map(|t| self.fmt_time(t)))
+            .bind(last_warmup_at.map(|t| self.fmt_time(t)))
+            .bind(last_warmup_status)
+            .bind(last_warmup_message)
+            .bind(warmup_retry_count)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn clear_warmup_state(&self, id: i64) -> Result<(), AppError> {
+        let q = format!(
+            "UPDATE accounts SET next_warmup_at=NULL, warmup_retry_count=0, updated_at={} WHERE id=$1",
+            self.now_expr()
+        );
+        sqlx::query(&q).bind(id).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -514,6 +554,8 @@ const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_
     billing_mode, account_uuid, organization_uuid, subscription_type,
     concurrency, priority, rate_limited_at, rate_limit_reset_at,
     disable_reason, auto_telemetry, telemetry_count,
+    warmup_enabled, next_warmup_at, last_warmup_at, last_warmup_status,
+    last_warmup_message, warmup_retry_count,
     usage_data, usage_fetched_at, created_at, updated_at"#;
 
 const ACCOUNT_COLS_PG_TEXT: &str = r#"id, name, email, status, token, auth_type, access_token, refresh_token,
@@ -525,6 +567,9 @@ const ACCOUNT_COLS_PG_TEXT: &str = r#"id, name, email, status, token, auth_type,
     concurrency, priority, rate_limited_at::text AS rate_limited_at,
     rate_limit_reset_at::text AS rate_limit_reset_at,
     disable_reason, auto_telemetry, telemetry_count,
+    warmup_enabled, next_warmup_at::text AS next_warmup_at,
+    last_warmup_at::text AS last_warmup_at, last_warmup_status,
+    last_warmup_message, warmup_retry_count,
     usage_data::text AS usage_data, usage_fetched_at::text AS usage_fetched_at,
     created_at::text AS created_at, updated_at::text AS updated_at"#;
 

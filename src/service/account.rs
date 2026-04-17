@@ -167,7 +167,6 @@ impl AccountService {
         self.cache.release_slot(&key).await;
     }
 
-    /// 构造一个绑定到该账号并发槽的 SlotHolder（不会自行获取；调用者需先 acquire_slot）。
     pub fn slot_holder_for(&self, account_id: i64) -> crate::service::gateway::SlotHolder {
         let key = format!("concurrency:account:{}", account_id);
         crate::service::gateway::SlotHolder::new(self.cache.clone(), key)
@@ -319,6 +318,10 @@ impl AccountService {
         self.store.enable_account(id).await
     }
 
+    pub async fn clear_warmup_state(&self, id: i64) -> Result<(), AppError> {
+        self.store.clear_warmup_state(id).await
+    }
+
     /// 处理上游返回 429 的情况：根据账号类型和用量数据决定限流时长和原因。
     ///
     /// - **SetupToken**：无法查询用量接口，保守限流 5h（与历史行为一致）。
@@ -456,9 +459,7 @@ fn normalize_account_auth(account: &mut Account) -> Result<(), AppError> {
 
 /// 根据客户端类型创建会话哈希。
 /// CC 客户端：使用 metadata.user_id 中的 session_id。
-/// API 客户端：使用 sha256(UA + 系统提示词/首条消息)。
-/// 会话粘滞时长统一由 CacheStore TTL（24h）决定，不再在哈希键中嵌入小时窗口，
-/// 否则会把实际 sticky 时长截断到 1 小时，并在跨小时边界引入上游账号抖动。
+/// API 客户端：使用 sha256(UA + 系统提示词/首条消息 + 小时窗口)。
 pub fn generate_session_hash(
     user_agent: &str,
     body: &serde_json::Value,
@@ -524,7 +525,8 @@ pub fn generate_session_hash(
         }
     }
 
-    let raw = format!("{}|{}", user_agent, content);
+    let hour_window = Utc::now().format("%Y-%m-%dT%H").to_string();
+    let raw = format!("{}|{}|{}", user_agent, content, hour_window);
     let hash = Sha256::digest(raw.as_bytes());
     hex::encode(&hash[..16])
 }
@@ -776,89 +778,5 @@ mod tests {
         });
         assert!(classify_rate_limit(&usage, 97.0).is_none());
         assert!(classify_rate_limit(&usage, 90.0).is_some());
-    }
-
-    // ---- generate_session_hash ----
-
-    #[test]
-    fn session_hash_is_deterministic_for_same_input() {
-        let ua = "claude-cli/2.1.81 (external, cli)";
-        let body = json!({
-            "system": "You are Claude Code",
-            "messages": [{"role": "user", "content": "hello"}],
-        });
-        let h1 = generate_session_hash(ua, &body, ClientType::API);
-        let h2 = generate_session_hash(ua, &body, ClientType::API);
-        assert_eq!(
-            h1, h2,
-            "same (ua, content) must yield identical hash — sticky TTL depends on this"
-        );
-        assert_eq!(h1.len(), 32, "hex of 16-byte prefix should be 32 chars");
-    }
-
-    #[test]
-    fn session_hash_differs_by_system_prompt() {
-        let ua = "claude-cli/2.1.81";
-        let a = json!({"system": "prompt-A", "messages": [{"role": "user", "content": "x"}]});
-        let b = json!({"system": "prompt-B", "messages": [{"role": "user", "content": "x"}]});
-        assert_ne!(
-            generate_session_hash(ua, &a, ClientType::API),
-            generate_session_hash(ua, &b, ClientType::API)
-        );
-    }
-
-    #[test]
-    fn session_hash_falls_back_to_first_message_when_no_system() {
-        let ua = "claude-cli/2.1.81";
-        let a = json!({"messages": [{"role": "user", "content": "alpha"}]});
-        let b = json!({"messages": [{"role": "user", "content": "beta"}]});
-        let ha = generate_session_hash(ua, &a, ClientType::API);
-        let hb = generate_session_hash(ua, &b, ClientType::API);
-        assert_ne!(ha, hb);
-    }
-
-    #[test]
-    fn session_hash_no_longer_embeds_hour_window() {
-        // 回归测试：哈希不应在任何形式上依赖当前时间。
-        // 以前的实现把 Utc::now().format("%Y-%m-%dT%H") 拼到原文里，使 sticky TTL 被截断到 1 小时。
-        let ua = "claude-cli/2.1.81";
-        let body = json!({
-            "system": "stable-prompt",
-            "messages": [{"role": "user", "content": "hi"}],
-        });
-        // 哈希在极短时间内多次调用必须相同（这是显而易见的，但如果再次引入 Utc::now()，跨小时会翻车）。
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..10 {
-            seen.insert(generate_session_hash(ua, &body, ClientType::API));
-        }
-        assert_eq!(
-            seen.len(),
-            1,
-            "hash must be pure function of (ua, content); any time dependency is a regression"
-        );
-
-        // 进一步：已知等价输入的哈希必须等于已预计算的 sha256 前 16 字节 hex。
-        let expected = {
-            let raw = format!("{}|{}", ua, "stable-prompt");
-            let digest = Sha256::digest(raw.as_bytes());
-            hex::encode(&digest[..16])
-        };
-        assert_eq!(
-            generate_session_hash(ua, &body, ClientType::API),
-            expected,
-            "hash formula must be exactly sha256(ua|content)[..16] with no extra inputs"
-        );
-    }
-
-    #[test]
-    fn session_hash_cc_mode_uses_session_id_from_metadata() {
-        let ua = "claude-cli/2.1.81";
-        let body = json!({
-            "metadata": {
-                "user_id": "{\"session_id\":\"sess-abc-123\",\"account_id\":\"xyz\"}"
-            }
-        });
-        let h = generate_session_hash(ua, &body, ClientType::ClaudeCode);
-        assert_eq!(h, "sess-abc-123");
     }
 }

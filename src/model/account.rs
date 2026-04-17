@@ -182,6 +182,18 @@ pub struct Account {
     #[serde(default)]
     pub telemetry_count: i64,
     #[serde(default)]
+    pub warmup_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_warmup_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_warmup_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_warmup_status: String,
+    #[serde(default)]
+    pub last_warmup_message: String,
+    #[serde(default)]
+    pub warmup_retry_count: i32,
+    #[serde(default)]
     pub usage_data: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_fetched_at: Option<DateTime<Utc>>,

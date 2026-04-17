@@ -4,6 +4,7 @@ use claude_code_gateway::service;
 use claude_code_gateway::store;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tracing::info;
 
 #[tokio::main]
@@ -71,6 +72,15 @@ async fn main() {
         pool.clone(),
         driver.clone(),
     ));
+    let settings_store = Arc::new(store::settings_store::SettingsStore::new(pool.clone()));
+
+    let quarantine_on_429_init = settings_store
+        .get("quarantine_on_429")
+        .await
+        .unwrap_or(None)
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    let quarantine_on_429 = Arc::new(AtomicBool::new(quarantine_on_429_init));
 
     let account_svc = Arc::new(service::account::AccountService::new(
         account_store.clone(),
@@ -85,6 +95,7 @@ async fn main() {
         account_svc.clone(),
         rewriter.clone(),
         telemetry_svc.clone(),
+        quarantine_on_429,
     ));
     let token_tester = Arc::new(service::oauth::TokenTester::new());
     let oauth_flow_svc = Arc::new(service::oauth_flow::OAuthFlowService::new());
@@ -99,6 +110,19 @@ async fn main() {
         async move { poller.run().await }
     });
 
+    let warmup_scheduler = Arc::new(service::warmup_scheduler::WarmupSchedulerService::new(
+        account_store.clone(),
+        account_svc.clone(),
+        cache.clone(),
+        settings_store.clone(),
+        token_tester.clone(),
+        cfg.warmup.clone(),
+    ));
+    tokio::spawn({
+        let scheduler = warmup_scheduler.clone();
+        async move { scheduler.run().await }
+    });
+
     let app = handler::router::build_router(
         &cfg,
         gateway_svc,
@@ -107,6 +131,7 @@ async fn main() {
         token_store,
         oauth_flow_svc,
         telemetry_svc,
+        settings_store,
     );
 
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);

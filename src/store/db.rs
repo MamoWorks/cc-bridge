@@ -58,7 +58,11 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         sqlx::query(stmt).execute(pool).await?;
     }
     // 增量迁移 — use correct PG types for TIMESTAMPTZ / JSONB columns
-    let ts_type = if driver == "sqlite" { "TEXT" } else { "TIMESTAMPTZ" };
+    let ts_type = if driver == "sqlite" {
+        "TEXT"
+    } else {
+        "TIMESTAMPTZ"
+    };
     let json_type = if driver == "sqlite" { "TEXT" } else { "JSONB" };
 
     sqlx::query("ALTER TABLE accounts ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'strip'")
@@ -133,13 +137,74 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await
         .ok();
+    sqlx::query("ALTER TABLE accounts ADD COLUMN warmup_enabled INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query(&format!(
+        "ALTER TABLE accounts ADD COLUMN next_warmup_at {}",
+        ts_type
+    ))
+    .execute(pool)
+    .await
+    .ok();
+    sqlx::query(&format!(
+        "ALTER TABLE accounts ADD COLUMN last_warmup_at {}",
+        ts_type
+    ))
+    .execute(pool)
+    .await
+    .ok();
+    sqlx::query("ALTER TABLE accounts ADD COLUMN last_warmup_status TEXT NOT NULL DEFAULT ''")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("ALTER TABLE accounts ADD COLUMN last_warmup_message TEXT NOT NULL DEFAULT ''")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("ALTER TABLE accounts ADD COLUMN warmup_retry_count INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await
+        .ok();
+
+    let settings_schema = if driver == "sqlite" {
+        SQLITE_SETTINGS_SCHEMA
+    } else {
+        PG_SETTINGS_SCHEMA
+    };
+    for stmt in settings_schema.split(';') {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        sqlx::query(stmt).execute(pool).await?;
+    }
+    if driver == "sqlite" {
+        sqlx::query(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('quarantine_on_429', 'true')",
+        )
+        .execute(pool)
+        .await
+        .ok();
+    } else {
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('quarantine_on_429', 'true') \
+             ON CONFLICT (key) DO NOTHING",
+        )
+        .execute(pool)
+        .await
+        .ok();
+    }
 
     // Fix column types for existing PG databases that may have TEXT instead of TIMESTAMPTZ/JSONB
     if driver != "sqlite" {
-        sqlx::query("ALTER TABLE accounts ALTER COLUMN usage_data TYPE JSONB USING usage_data::JSONB")
-            .execute(pool)
-            .await
-            .ok();
+        sqlx::query(
+            "ALTER TABLE accounts ALTER COLUMN usage_data TYPE JSONB USING usage_data::JSONB",
+        )
+        .execute(pool)
+        .await
+        .ok();
         sqlx::query("ALTER TABLE accounts ALTER COLUMN usage_fetched_at TYPE TIMESTAMPTZ USING usage_fetched_at::TIMESTAMPTZ")
             .execute(pool)
             .await
@@ -149,6 +214,14 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             .await
             .ok();
         sqlx::query("ALTER TABLE accounts ALTER COLUMN oauth_refreshed_at TYPE TIMESTAMPTZ USING oauth_refreshed_at::TIMESTAMPTZ")
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("ALTER TABLE accounts ALTER COLUMN next_warmup_at TYPE TIMESTAMPTZ USING next_warmup_at::TIMESTAMPTZ")
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("ALTER TABLE accounts ALTER COLUMN last_warmup_at TYPE TIMESTAMPTZ USING last_warmup_at::TIMESTAMPTZ")
             .execute(pool)
             .await
             .ok();
@@ -199,6 +272,12 @@ CREATE TABLE IF NOT EXISTS accounts (
     disable_reason       TEXT NOT NULL DEFAULT '',
     auto_telemetry       INTEGER NOT NULL DEFAULT 0,
     telemetry_count      INTEGER NOT NULL DEFAULT 0,
+    warmup_enabled       INTEGER NOT NULL DEFAULT 0,
+    next_warmup_at       TEXT,
+    last_warmup_at       TEXT,
+    last_warmup_status   TEXT NOT NULL DEFAULT '',
+    last_warmup_message  TEXT NOT NULL DEFAULT '',
+    warmup_retry_count   INTEGER NOT NULL DEFAULT 0,
     usage_data           TEXT NOT NULL DEFAULT '{}',
     usage_fetched_at     TEXT,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
@@ -236,12 +315,32 @@ CREATE TABLE IF NOT EXISTS accounts (
     disable_reason       TEXT NOT NULL DEFAULT '',
     auto_telemetry       INT NOT NULL DEFAULT 0,
     telemetry_count      BIGINT NOT NULL DEFAULT 0,
+    warmup_enabled       INT NOT NULL DEFAULT 0,
+    next_warmup_at       TIMESTAMPTZ,
+    last_warmup_at       TIMESTAMPTZ,
+    last_warmup_status   TEXT NOT NULL DEFAULT '',
+    last_warmup_message  TEXT NOT NULL DEFAULT '',
+    warmup_retry_count   INT NOT NULL DEFAULT 0,
     usage_data           JSONB NOT NULL DEFAULT '{}',
     usage_fetched_at     TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+"#;
+
+const SQLITE_SETTINGS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+)
+"#;
+
+const PG_SETTINGS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+)
 "#;
 
 const SQLITE_TOKENS_SCHEMA: &str = r#"

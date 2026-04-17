@@ -47,6 +47,7 @@ const form = ref({
   concurrency: 3,
   priority: 50,
   auto_telemetry: false,
+  warmup_enabled: false,
 });
 /** 正在测试的账号 ID */
 const testing = ref<number | null>(null);
@@ -123,6 +124,7 @@ function openCreate() {
     concurrency: 3,
     priority: 50,
     auto_telemetry: false,
+    warmup_enabled: false,
   };
   showForm.value = true;
 }
@@ -149,6 +151,7 @@ function openEdit(a: Account) {
     concurrency: a.concurrency,
     priority: a.priority,
     auto_telemetry: a.auto_telemetry ?? false,
+    warmup_enabled: a.warmup_enabled ?? false,
   };
   showForm.value = true;
 }
@@ -185,6 +188,7 @@ async function save() {
       updates.concurrency = form.value.concurrency;
       updates.priority = form.value.priority;
       updates.auto_telemetry = form.value.auto_telemetry;
+      updates.warmup_enabled = form.value.warmup_enabled;
       await api.updateAccount(editing.value.id, updates);
     } else {
       if (form.value.auth_type === 'setup_token' && !form.value.setup_token.trim()) {
@@ -208,6 +212,7 @@ async function save() {
         concurrency: form.value.concurrency,
         priority: form.value.priority,
         auto_telemetry: form.value.auto_telemetry,
+        warmup_enabled: form.value.warmup_enabled,
       };
       if (normalizedExpiresAt) payload.expires_at = normalizedExpiresAt;
       await api.createAccount(payload);
@@ -413,6 +418,33 @@ function formatBytes(bytes?: number): string {
   return bytes + 'B';
 }
 
+function formatDateTime(value?: string): string {
+  if (!value) return '—';
+  return new Date(value).toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function warmupStatusClass(account: Account): string {
+  const status = account.last_warmup_status || '';
+  if (!account.warmup_enabled) return 'text-[#8c8475]';
+  if (status.startsWith('error:')) return 'text-red-500';
+  if (status === 'ok') return 'text-emerald-600';
+  return 'text-amber-600';
+}
+
+function warmupStatusLabel(account: Account): string {
+  if (!account.warmup_enabled) return '未参与';
+  const status = account.last_warmup_status || '';
+  if (status === 'ok') return '最近成功';
+  if (status.startsWith('error:')) return '最近失败';
+  if (account.next_warmup_at) return '等待执行';
+  return '未排程';
+}
+
 /** 切换认证方式 */
 function setAuthType(authType: 'setup_token' | 'oauth') {
   form.value.auth_type = authType;
@@ -502,6 +534,7 @@ function applyOAuthResult() {
     concurrency: 3,
     priority: 50,
     auto_telemetry: false,
+    warmup_enabled: false,
   };
   showForm.value = true;
 }
@@ -626,6 +659,29 @@ async function copyText(text: string) {
                 </p>
                 <p v-if="a.telemetry_expires_at" class="text-xs text-amber-500 mt-0.5">
                   遥测中 · 停止于 {{ new Date(a.telemetry_expires_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }}
+                </p>
+              </div>
+              <div>
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">预热</p>
+                <p class="text-sm" :class="warmupStatusClass(a)">
+                  {{ a.warmup_enabled ? '已开启' : '关闭' }}
+                  <span class="text-[#b5b0a6] text-xs">· {{ warmupStatusLabel(a) }}</span>
+                  <span v-if="a.warmup_retry_count > 0" class="text-[#b5b0a6] text-xs">· 重试 {{ a.warmup_retry_count }} 次</span>
+                </p>
+                <p v-if="a.next_warmup_at" class="text-xs text-[#8c8475] mt-0.5">
+                  下次预热 · {{ formatDateTime(a.next_warmup_at) }}
+                </p>
+                <p v-if="a.last_warmup_at" class="text-xs text-[#8c8475] mt-0.5">
+                  最近执行 · {{ formatDateTime(a.last_warmup_at) }}
+                </p>
+                <p v-if="a.last_warmup_message" class="text-xs text-[#b5b0a6] mt-0.5 line-clamp-2">
+                  {{ a.last_warmup_message }}
+                </p>
+                <p
+                  v-if="a.last_warmup_status && a.last_warmup_status.startsWith('error:')"
+                  class="text-xs text-red-500 mt-0.5 line-clamp-2"
+                >
+                  {{ a.last_warmup_status }}
                 </p>
               </div>
               <div>
@@ -1043,6 +1099,32 @@ async function copyText(text: string) {
               </button>
             </div>
             <p class="text-xs text-[#b5b0a6]">开启后由网关代替客户端发送遥测请求</p>
+          </div>
+          <div class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">预热计划</Label>
+            <div class="flex gap-2">
+              <button
+                type="button"
+                @click="form.warmup_enabled = false"
+                class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                :class="!form.warmup_enabled
+                  ? 'bg-[#f9f6f1] border-[#8c8475] text-[#5c5647]'
+                  : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-[#8c8475]/40'"
+              >
+                不参与
+              </button>
+              <button
+                type="button"
+                @click="form.warmup_enabled = true"
+                class="flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-all duration-200"
+                :class="form.warmup_enabled
+                  ? 'bg-amber-50 border-amber-400 text-amber-600'
+                  : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-amber-300'"
+              >
+                参与预热
+              </button>
+            </div>
+            <p class="text-xs text-[#b5b0a6]">开启后由后台按全局预热设置随机安排每日问候测试</p>
           </div>
           <div class="flex gap-4">
             <div class="flex-1 space-y-2">
