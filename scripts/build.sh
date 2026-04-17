@@ -1,5 +1,5 @@
 #!/bin/bash
-# 构建 claude-code-gateway：前端 + Rust 后端
+# 构建 cc-bridge：前端 + Rust 后端
 # 前端资源在编译时嵌入二进制，部署只需可执行文件 + .env
 # 用法: ./build.sh [target]
 #   target: linux-amd64 | linux-arm64 | 留空则构建当前平台
@@ -16,15 +16,15 @@ OUTPUT_DIR="$PROJECT_DIR/dist"
 case "$TARGET" in
     linux-amd64)
         RUST_TARGET="x86_64-unknown-linux-gnu"
-        BINARY_NAME="claude-code-gateway-linux-amd64"
+        BINARY_NAME="cc-bridge-linux-amd64"
         ;;
     linux-arm64)
         RUST_TARGET="aarch64-unknown-linux-gnu"
-        BINARY_NAME="claude-code-gateway-linux-arm64"
+        BINARY_NAME="cc-bridge-linux-arm64"
         ;;
     native)
         RUST_TARGET=""
-        BINARY_NAME="claude-code-gateway"
+        BINARY_NAME="cc-bridge"
         ;;
     *)
         echo "Unknown target: $TARGET"
@@ -33,7 +33,7 @@ case "$TARGET" in
         ;;
 esac
 
-echo "=== claude-code-gateway build ==="
+echo "=== cc-bridge build ==="
 echo "Target: $TARGET"
 
 # 1. 清理旧构建产物
