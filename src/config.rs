@@ -132,7 +132,7 @@ impl Config {
                 env::var("USAGE_POLL_INTERVAL_SECS")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(300),
+                    .unwrap_or(600),
             ),
         }
     }

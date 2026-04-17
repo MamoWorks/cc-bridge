@@ -44,7 +44,7 @@ const form = ref({
   account_uuid: '',
   organization_uuid: '',
   subscription_type: '',
-  concurrency: 3,
+  concurrency: 5,
   priority: 50,
   auto_telemetry: false,
 });
@@ -120,7 +120,7 @@ function openCreate() {
     account_uuid: '',
     organization_uuid: '',
     subscription_type: '',
-    concurrency: 3,
+    concurrency: 5,
     priority: 50,
     auto_telemetry: false,
   };
@@ -499,7 +499,7 @@ function applyOAuthResult() {
     account_uuid: r.account_uuid || '',
     organization_uuid: r.organization_uuid || '',
     subscription_type: '',
-    concurrency: 3,
+    concurrency: 5,
     priority: 50,
     auto_telemetry: false,
   };

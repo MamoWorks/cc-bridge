@@ -1,10 +1,13 @@
 use chrono::Utc;
 use rand::Rng;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 use tokio::time::sleep;
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -26,14 +29,68 @@ const PURE_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 /// 无法确定限流原因时的保守限流时长（与历史行为一致）。
 const FALLBACK_QUARANTINE: Duration = Duration::from_secs(5 * 60 * 60);
 
+/// `/api/oauth/usage` 查询端点的本地缓存有效期：60s 内已有成功结果则直接复用 DB 数据，
+/// 避免 UI 反复点击 / poller / 429 处理路径同时打上游。
+const USAGE_FRESH_TTL: Duration = Duration::from_secs(60);
+/// `/api/oauth/usage` 收到 429 后的本地冷却时间：60s 内不再尝试上游。
+const USAGE_429_COOLDOWN: Duration = Duration::from_secs(60);
+
 pub struct AccountService {
     store: Arc<AccountStore>,
     cache: Arc<dyn CacheStore>,
+    /// 账号级 `/api/oauth/usage` 429 冷却（in-memory，重启即清空，无需持久化）。
+    usage_cooldown: Mutex<HashMap<i64, Instant>>,
+    /// 自上次被 usage_poller 消费以来，是否有 `/v1/messages` 请求被处理。
+    /// 用于活动驱动的用量轮询：空闲态不发起任何 `/api/oauth/usage` 调用。
+    messages_activity: AtomicBool,
+    /// 唤醒空闲中的 usage_poller。
+    activity_notify: Notify,
 }
 
 impl AccountService {
     pub fn new(store: Arc<AccountStore>, cache: Arc<dyn CacheStore>) -> Self {
-        Self { store, cache }
+        Self {
+            store,
+            cache,
+            usage_cooldown: Mutex::new(HashMap::new()),
+            messages_activity: AtomicBool::new(false),
+            activity_notify: Notify::new(),
+        }
+    }
+
+    /// 当前是否处于 429 冷却期。
+    fn usage_in_cooldown(&self, id: i64) -> bool {
+        let mut map = self.usage_cooldown.lock().unwrap();
+        match map.get(&id) {
+            Some(until) if *until > Instant::now() => true,
+            Some(_) => {
+                map.remove(&id);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn mark_usage_cooldown(&self, id: i64) {
+        let mut map = self.usage_cooldown.lock().unwrap();
+        map.insert(id, Instant::now() + USAGE_429_COOLDOWN);
+    }
+
+    /// gateway 在每次 `/v1/messages` 请求到来时调用，标记有业务活动。
+    /// usage_poller 据此决定是否轮询。
+    pub fn record_messages_activity(&self) {
+        self.messages_activity.store(true, Ordering::Relaxed);
+        self.activity_notify.notify_one();
+    }
+
+    /// usage_poller 调用：取出活动标志并清空。返回是否曾有活动。
+    pub fn take_messages_activity(&self) -> bool {
+        self.messages_activity.swap(false, Ordering::Relaxed)
+    }
+
+    /// usage_poller 调用：异步等待下一次活动通知。
+    pub async fn wait_for_messages_activity(&self) {
+        self.activity_notify.notified().await;
     }
 
     /// 创建新账号并自动生成身份信息。
@@ -175,6 +232,11 @@ impl AccountService {
 
     /// 从 Anthropic API 获取账号用量并缓存到数据库。
     /// 仅支持 OAuth 账号，SetupToken 账号无法查询用量。
+    ///
+    /// 限频策略：
+    /// - DB 中 `usage_fetched_at` < 60s 的成功结果直接复用（覆盖 UI 反复点击 / poller / handle_429 三个调用源）；
+    /// - 上游回 429 后，账号进入 60s 本地冷却，期间所有调用直接返回 `TooManyRequests`，
+    ///   让 `handle_rate_limit` 可以正确 fallback 到保守 5h 限流，避免持续打上游被滚雪球。
     pub async fn refresh_usage(&self, id: i64) -> Result<serde_json::Value, AppError> {
         let account = self.store.get_by_id(id).await?;
         if account.auth_type != crate::model::account::AccountAuthType::Oauth {
@@ -182,11 +244,58 @@ impl AccountService {
                 "usage query is only supported for OAuth accounts, SetupToken accounts cannot query usage via this endpoint".into(),
             ));
         }
+
+        // 1) 60s 内有成功查询 → 直接复用 DB 数据，不打上游。
+        if let Some(fetched_at) = account.usage_fetched_at {
+            let age = Utc::now().signed_duration_since(fetched_at);
+            if age.num_seconds() >= 0
+                && age.to_std().map(|d| d < USAGE_FRESH_TTL).unwrap_or(false)
+            {
+                info!(
+                    "refresh_usage: account {} → cache hit (age={}s, ttl=60s)",
+                    id,
+                    age.num_seconds()
+                );
+                return Ok(account.usage_data.clone());
+            }
+        }
+
+        // 2) 60s 内被上游 429 过 → 直接返回 Err，跳过上游。
+        if self.usage_in_cooldown(id) {
+            info!(
+                "refresh_usage: account {} → in 60s 429 cooldown, skipping upstream",
+                id
+            );
+            return Err(AppError::TooManyRequests(
+                "usage query in 60s local cooldown after recent 429".into(),
+            ));
+        }
+
+        info!(
+            "refresh_usage: account {} → fetching upstream /api/oauth/usage",
+            id
+        );
         let token = self.resolve_oauth_access_token(&account).await?;
-        let usage = crate::service::oauth::fetch_usage(&token, &account.proxy_url).await?;
-        let usage_str = serde_json::to_string(&usage).unwrap_or_else(|_| "{}".into());
-        self.store.update_usage(id, &usage_str).await?;
-        Ok(usage)
+        match crate::service::oauth::fetch_usage(&token, &account.proxy_url).await {
+            Ok(usage) => {
+                let usage_str = serde_json::to_string(&usage).unwrap_or_else(|_| "{}".into());
+                self.store.update_usage(id, &usage_str).await?;
+                info!("refresh_usage: account {} → upstream OK, cached", id);
+                Ok(usage)
+            }
+            Err(e) => {
+                if matches!(e, AppError::TooManyRequests(_)) {
+                    self.mark_usage_cooldown(id);
+                    warn!(
+                        "refresh_usage: account {} → upstream 429, cooldown for 60s: {}",
+                        id, e
+                    );
+                } else {
+                    warn!("refresh_usage: account {} → upstream error: {}", id, e);
+                }
+                Err(e)
+            }
+        }
     }
 
     pub async fn resolve_upstream_token(&self, id: i64) -> Result<String, AppError> {
@@ -326,7 +435,10 @@ impl AccountService {
     ///   - 命中 7 天墙 → 限流到周重置时间
     ///   - 命中 5 小时墙 → 限流到 5h 重置时间
     ///   - 都没撞墙 → 纯速率限制，短冷却 1 分钟
-    ///   - usage 接口调用失败 → 回退到 5h 保守限流
+    ///   - **usage 接口本身也 429 / 失败 → 同样按 1 分钟短冷却处理**
+    ///     （之前是 5h 兜底，但 OAuth 撞 5h 墙的概率远低于"短期速率峰值 + usage 端点也限流"
+    ///     的概率，5h 兜底反而经常误锁好账号；用 1 分钟短冷却让账号能快速恢复，真撞墙的话
+    ///     1 分钟后业务请求会再次 429，再次进入此函数重新分类）
     ///
     /// Sonnet 7 天墙暂不纳入判断（上游可能只对 Sonnet 请求返回 429，不影响其他模型）。
     pub async fn handle_rate_limit(&self, account: &Account) -> Result<(), AppError> {
@@ -352,25 +464,34 @@ impl AccountService {
         account: &Account,
     ) -> (&'static str, chrono::DateTime<Utc>) {
         let now = Utc::now();
-        let fallback = || {
+        // SetupToken 兜底：用量端点对 setup_token 不可用，无法分类，只能保守 5h
+        let setup_token_fallback = || {
             (
                 "429 速率限制",
                 now + chrono::Duration::from_std(FALLBACK_QUARANTINE).unwrap(),
             )
         };
+        // OAuth 用量未知：usage 端点也限流 / 失败，按 1 分钟短冷却处理
+        let oauth_unknown_short_cooldown = || {
+            (
+                "速率限制（用量未知）",
+                now + chrono::Duration::from_std(PURE_RATE_LIMIT_COOLDOWN).unwrap(),
+            )
+        };
 
         if account.auth_type != AccountAuthType::Oauth {
-            return fallback();
+            return setup_token_fallback();
         }
 
         let usage = match self.refresh_usage(account.id).await {
             Ok(u) => u,
             Err(e) => {
                 warn!(
-                    "failed to fetch usage for rate-limited oauth account {}: {}",
+                    "failed to fetch usage for rate-limited oauth account {}: {} \
+                     — using 1min short cooldown instead of 5h fallback",
                     account.id, e
                 );
-                return fallback();
+                return oauth_unknown_short_cooldown();
             }
         };
 

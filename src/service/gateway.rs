@@ -204,6 +204,8 @@ impl GatewayService {
                     self.telemetry_svc
                         .activate_session(&account, model_id)
                         .await;
+                    // 通知 usage_poller "有业务活动"，触发活动驱动的用量轮询
+                    self.account_svc.record_messages_activity();
                 }
             }
 

@@ -9,7 +9,13 @@ use crate::service::account::AccountService;
 /// 账户间隔,避免瞬间打爆 Anthropic usage 端点。
 const PER_ACCOUNT_GAP: Duration = Duration::from_millis(500);
 
-/// 后台定时拉取所有 OAuth 账户用量数据的服务。
+/// 后台用量轮询服务（活动驱动）：
+/// - 空闲态：不发起任何 `/api/oauth/usage` 调用，等待 `/v1/messages` 业务活动
+/// - 首次活动到来 → 立即拉一遍所有 OAuth 账号的用量，进入活跃态
+/// - 活跃态：每 `interval` tick 一次；若上一窗口内仍有业务活动则继续 tick；
+///   若一个完整窗口内没有任何活动 → 回到空闲态停止轮询
+///
+/// 这样部署在 24h 长跑的实例上，没人用的时候完全不打上游 usage 端点。
 pub struct UsagePollerService {
     account_svc: Arc<AccountService>,
     interval: Duration,
@@ -25,12 +31,36 @@ impl UsagePollerService {
 
     /// 启动后台循环。应在 main 中 tokio::spawn 调用。
     pub async fn run(self: Arc<Self>) {
-        info!("usage poller: started, interval = {:?}", self.interval);
-        // 启动后先等一个 interval,避免和应用冷启动抢资源
-        sleep(self.interval).await;
+        info!(
+            "usage poller: started in idle mode (interval={:?}); waits for /v1/messages activity",
+            self.interval
+        );
         loop {
+            // ===== 空闲态：等待第一次 /v1/messages 活动 =====
+            loop {
+                if self.account_svc.take_messages_activity() {
+                    break;
+                }
+                self.account_svc.wait_for_messages_activity().await;
+            }
+
+            info!("usage poller: activity detected → first poll");
             self.tick().await;
-            sleep(self.interval).await;
+
+            // ===== 活跃态：每 interval 检查一次活动 =====
+            loop {
+                sleep(self.interval).await;
+                if self.account_svc.take_messages_activity() {
+                    info!("usage poller: continued activity → polling");
+                    self.tick().await;
+                } else {
+                    info!(
+                        "usage poller: no activity in last {:?} → going idle",
+                        self.interval
+                    );
+                    break; // 回到外层空闲态
+                }
+            }
         }
     }
 

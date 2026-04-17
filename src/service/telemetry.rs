@@ -455,6 +455,7 @@ async fn send_telemetry(
         .header("Content-Type", "application/json")
         .header("User-Agent", user_agent)
         .header("x-service-name", "claude-code")
+        .header("anthropic-beta", "oauth-2025-04-20")
         .header("Authorization", format!("Bearer {}", token))
         .json(body)
         .send()
