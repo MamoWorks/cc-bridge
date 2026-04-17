@@ -1,3 +1,3 @@
-project_name=claude-code-gateway
+project_name=cc-bridge
 version=1.7.5
-image_name=ghcr.io/mamoworks/claude-code-gateway
+image_name=ghcr.io/mamoworks/cc-bridge

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Claude Code Gateway is a Rust reverse proxy for the Anthropic API that pools multiple Claude accounts with load balancing, rate limit handling, sticky sessions, TLS fingerprint spoofing, and request/response rewriting. It includes a Vue 3 management dashboard embedded into the single binary via `rust-embed`.
+Claude Code Gateway (cc-bridge) is a Rust reverse proxy for the Anthropic API that pools multiple Claude accounts with load balancing, rate limit handling, sticky sessions, TLS fingerprint spoofing, and request/response rewriting. It includes a Vue 3 management dashboard embedded into the single binary via `rust-embed`.
 
 ## Build & Run Commands
 
@@ -22,7 +22,7 @@ cargo run                           # Backend on :5674 (frontend proxies to it)
 ./scripts/build.sh linux-amd64     # Cross-compile
 
 # Docker
-docker build -f docker/Dockerfile -t claude-code-gateway:latest .
+docker build -f docker/Dockerfile -t cc-bridge:latest .
 ```
 
 No test suite exists. Account validity is tested via the UI's "test" button.

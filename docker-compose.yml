@@ -1,7 +1,7 @@
 services:
-  claude-code-gateway:
-    image: ghcr.io/mamoworks/claude-code-gateway:latest
-    container_name: claude-code-gateway
+  cc-bridge:
+    image: ghcr.io/mamoworks/cc-bridge:latest
+    container_name: cc-bridge
     env_file:
       - .env
     depends_on:
@@ -9,12 +9,12 @@ services:
     ports:
       - "${SERVER_PORT:-5674}:5674"
     volumes:
-      - claude-code-gateway-data:/app/data
+      - cc-bridge-data:/app/data
     restart: unless-stopped
 
   # postgres:
   #   image: postgres:17-alpine
-  #   container_name: claude-code-gateway-postgres
+  #   container_name: cc-bridge-postgres
   #   env_file:
   #     - .env
   #   ports:
@@ -30,7 +30,7 @@ services:
 
   # redis:
   #   image: redis:7-alpine
-  #   container_name: claude-code-gateway-redis
+  #   container_name: cc-bridge-redis
   #   profiles: ["redis"]
   #   env_file:
   #     - .env
@@ -59,6 +59,6 @@ services:
   #   restart: unless-stopped
 
 volumes:
-  claude-code-gateway-data:
+  cc-bridge-data:
   postgres-data:
   redis-data:

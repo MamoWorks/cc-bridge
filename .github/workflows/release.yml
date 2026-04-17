@@ -62,15 +62,15 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: claude-code-gateway-linux-amd64
+            artifact: cc-bridge-linux-amd64
             cross: false
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: claude-code-gateway-linux-arm64
+            artifact: cc-bridge-linux-arm64
             cross: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact: claude-code-gateway-win-amd64.exe
+            artifact: cc-bridge-win-amd64.exe
             cross: false
 
     runs-on: ${{ matrix.os }}
@@ -170,7 +170,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          pattern: claude-code-gateway-*
+          pattern: cc-bridge-*
           path: artifacts
           merge-multiple: true
 

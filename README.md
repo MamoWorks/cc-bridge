@@ -8,7 +8,7 @@
 [![Build](https://img.shields.io/github/actions/workflow/status/MamoWorks/cc-bridge/release.yml?style=flat-square)](https://github.com/MamoWorks/cc-bridge/actions)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-green?style=flat-square)](./craftls/LICENSE)
 [![Rust](https://img.shields.io/badge/rust-%E2%89%A51.82-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
-[![Docker](https://img.shields.io/badge/docker-ghcr.io-blue?style=flat-square&logo=docker)](https://ghcr.io/mamoworks/claude-code-gateway)
+[![Docker](https://img.shields.io/badge/docker-ghcr.io-blue?style=flat-square&logo=docker)](https://ghcr.io/mamoworks/cc-bridge)
 
 <br/>
 
@@ -272,7 +272,22 @@ cd docker && docker compose up -d
 
 
 
-> SQLite 数据持久化到命名卷 `claude-code-gateway-data`。
+> SQLite 数据持久化到命名卷 `cc-bridge-data`。
+
+> **⚠️ 从 `claude-code-gateway` 升级到 `cc-bridge`**:镜像地址由 `ghcr.io/mamoworks/claude-code-gateway` 迁移到 `ghcr.io/mamoworks/cc-bridge`,compose 服务名/容器名/卷名均已改为 `cc-bridge` / `cc-bridge-data`。升级旧部署需迁移数据卷:
+>
+> ```bash
+> docker compose down                          # 不要加 -v
+> docker volume create cc-bridge-data
+> docker run --rm \
+>     -v claude-code-gateway-data:/from \
+>     -v cc-bridge-data:/to \
+>     alpine sh -c 'cp -a /from/. /to/'
+> docker compose pull && docker compose up -d  # 使用新 compose 文件
+> # 确认无误后：docker volume rm claude-code-gateway-data
+> ```
+>
+> Cargo crate 名、SQLite 默认文件名 (`data/claude-code-gateway.db`)、localStorage 登录态 key 均保持不变,本地构建、老配置、已登录会话不受影响。
 
 ### 生产建议
 

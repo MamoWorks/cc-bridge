@@ -36,7 +36,7 @@ onMounted(loadDashboard);
         <div class="flex items-center gap-6">
           <div class="flex items-center gap-2">
             <img src="/favicon.svg" alt="Logo" class="w-6 h-6" />
-            <h1 class="text-lg font-semibold text-[#29261e] tracking-tight">Claude Code Gateway</h1>
+            <h1 class="text-lg font-semibold text-[#29261e] tracking-tight">cc-bridge</h1>
           </div>
           <nav class="flex items-center gap-1">
             <router-link
