@@ -158,6 +158,14 @@ pub struct LimitState {
     /// 短期隔离窗口：遇到 429 且无 unified-* 证据时填充（retry-after 或 60s fallback）。
     /// 不需要 util>=97% 或 status=Rejected，仅凭"本轮撞到 429"即可拉黑一段时间。
     pub rate_limited_until: Option<DateTime<Utc>>,
+    /// Sonnet 专属短期隔离：Sonnet 429（`representative_claim=seven_day_sonnet`）时填充。
+    /// 只屏蔽 Sonnet 调度，Opus / 全局 availability 不受影响。
+    pub sonnet_limited_until: Option<DateTime<Utc>>,
+    /// 7 天 Sonnet 子 quota 快照。仅通过 `/api/oauth/usage` 填充（Anthropic 的响应头
+    /// `anthropic-ratelimit-unified-*` 不含 per-model 数据）。UI 展示用。
+    pub sonnet_seven_day: Option<WindowSnapshot>,
+    /// 7 天 Opus 子 quota 快照。同上。
+    pub opus_seven_day: Option<WindowSnapshot>,
     /// SetupToken 账号的 RPM/TPM 四路状态。OAuth 账号一般为 None。
     pub rpm_tpm: Option<RpmTpmSnapshot>,
     pub updated_at: Option<Instant>,
@@ -253,6 +261,24 @@ impl LimitStore {
         judge_availability(state)
     }
 
+    /// Sonnet selector 用：只检查 Sonnet 专属 ban 和全局 Rejected。
+    /// 5h/7d 窗口利用率、RPM/TPM 预抢等本地软限流均不适用于 Sonnet 请求。
+    pub fn sonnet_available(&self, account_id: i64) -> bool {
+        let map = self.states.lock().unwrap();
+        let Some(state) = map.get(&account_id) else {
+            return true;
+        };
+        if let Some(until) = state.sonnet_limited_until {
+            if until > Utc::now() {
+                return false;
+            }
+        }
+        if state.status == Some(UnifiedStatus::Rejected) {
+            return false;
+        }
+        true
+    }
+
     /// flush 当前内存状态到 DB：
     /// 1. `usage_data` JSON（完整快照，供 UI 读）
     /// 2. `rate_limit_reset_at` / `rate_limited_at`：
@@ -303,6 +329,12 @@ impl LimitStore {
         if let Some(w) = parse_usage_json_window(usage, "seven_day") {
             state.seven_day = Some(w);
         }
+        if let Some(w) = parse_usage_json_window(usage, "seven_day_sonnet") {
+            state.sonnet_seven_day = Some(w);
+        }
+        if let Some(w) = parse_usage_json_window(usage, "seven_day_opus") {
+            state.opus_seven_day = Some(w);
+        }
         state.updated_at = Some(Instant::now());
         map.insert(account_id, state);
     }
@@ -315,12 +347,13 @@ impl LimitStore {
 /// 返回 `None` 表示本次响应无可吸取信息（保持内存原样）；
 /// 返回 `Some(new_state)` 表示调用者应把内存替换为该状态。
 fn compute_new_state(prev: &LimitState, status: u16, headers: &HeaderMap) -> Option<LimitState> {
+    let is_sonnet_429 = status == 429 && is_sonnet_rejection(headers);
     let parsed_unified = parse_unified_headers(headers).map(|mut p| {
         // Sonnet 旁路：429 + representative-claim=seven_day_sonnet 时，
         // 不把全局 status=Rejected 写入内存热态。这样 judge_availability 不会拉黑账号，
         // 保留账号对 Opus / 5h/7d 聚合等其它模型/窗口的调度能力。
         // 其它字段（5h/7d util、reset、claim、overage）继续吸收，UI/日志仍完整。
-        if status == 429 && p.representative_claim.as_deref() == Some("seven_day_sonnet") {
+        if is_sonnet_429 {
             p.status = None;
         }
         p
@@ -344,6 +377,14 @@ fn compute_new_state(prev: &LimitState, status: u16, headers: &HeaderMap) -> Opt
                     Some(Utc::now() + chrono::Duration::from_std(ra).unwrap_or_default());
             }
         }
+        // Sonnet 专属短期隔离：优先用 retry-after，其次用 7d window reset，最后 1h 兜底。
+        if is_sonnet_429 {
+            let ban_end = retry_after
+                .map(|d| Utc::now() + chrono::Duration::from_std(d).unwrap_or_default())
+                .or_else(|| s.seven_day.as_ref().map(|w| w.resets_at))
+                .unwrap_or_else(|| Utc::now() + chrono::Duration::hours(1));
+            s.sonnet_limited_until = Some(ban_end);
+        }
         return Some(s);
     }
 
@@ -351,8 +392,11 @@ fn compute_new_state(prev: &LimitState, status: u16, headers: &HeaderMap) -> Opt
         // CF-layer 429：没有任何 unified-* / RPM/TPM 头，仅设短期 ban。
         let mut s = prev.clone();
         let ban = retry_after.unwrap_or(DEFAULT_429_BAN);
-        s.rate_limited_until =
-            Some(Utc::now() + chrono::Duration::from_std(ban).unwrap_or_default());
+        let ban_until = Utc::now() + chrono::Duration::from_std(ban).unwrap_or_default();
+        s.rate_limited_until = Some(ban_until);
+        if is_sonnet_429 {
+            s.sonnet_limited_until = Some(ban_until);
+        }
         return Some(s);
     }
 
@@ -719,6 +763,12 @@ fn build_usage_json(state: &LimitState) -> serde_json::Value {
     }
     if let Some(w) = &state.seven_day {
         obj.insert("seven_day".into(), window_to_json(w));
+    }
+    if let Some(w) = &state.sonnet_seven_day {
+        obj.insert("seven_day_sonnet".into(), window_to_json(w));
+    }
+    if let Some(w) = &state.opus_seven_day {
+        obj.insert("seven_day_opus".into(), window_to_json(w));
     }
     if let Some(s) = state.status {
         obj.insert("status".into(), serde_json::Value::from(s.as_str()));

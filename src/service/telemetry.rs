@@ -402,8 +402,21 @@ async fn telemetry_loop(
         // --- metrics (/api/claude_code/metrics) ---
         // 真实 CC (bigqueryExporter.ts) 对 OAuth 用户也会发，只要 token 有 user:profile scope。
         // 修复前的 "OAuth 不支持" 注释是错的 — 完全静默会被识别为代理。
+        // 但当前 build_metrics 还没实现真实 metric，固定发 metrics=[] 会被 Anthropic 400
+        // ("At least one metric must be provided")，反复 400 会让 device_id 被标记 →
+        // 后续 /v1/messages 被连带 429。空数组时直接跳过本轮发送。
         if now.duration_since(session.last_metrics_at) >= METRICS_INTERVAL {
             let payload = build_metrics(&session.account);
+            let has_metrics = payload
+                .get("metrics")
+                .and_then(|m| m.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            if !has_metrics {
+                session.last_metrics_at = now;
+                drop(map);
+                continue;
+            }
             let token = session.token.clone();
             let c = client.clone();
             session.last_metrics_at = now;

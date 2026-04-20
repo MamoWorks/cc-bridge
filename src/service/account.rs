@@ -147,8 +147,11 @@ impl AccountService {
                     if let Some(account) = account_opt {
                         let id_allowed =
                             allowed_ids.is_empty() || allowed_ids.contains(&account_id);
-                        let rate_limit_ok = skip_rate_limit_filter
-                            || self.limit_store.availability(account_id).is_available();
+                        let rate_limit_ok = if skip_rate_limit_filter {
+                            self.limit_store.sonnet_available(account_id)
+                        } else {
+                            self.limit_store.availability(account_id).is_available()
+                        };
                         if account.is_schedulable()
                             && !exclude_ids.contains(&account_id)
                             && id_allowed
@@ -168,8 +171,8 @@ impl AccountService {
         let total_schedulable = accounts.len();
 
         // 过滤：排除项 + 可用账号限制 + 限流状态（内存热态）
-        // Sonnet 请求旁路：skip_rate_limit_filter=true 时不做限流过滤，
-        // 让请求透传到上游，由 Anthropic 自己拒（维持"Sonnet 不参与本地限流"约定）。
+        // Sonnet 请求旁路：走 Sonnet 专属 ban 检查而非全量 availability，
+        // 让 5h/7d 高利用率 / RPM·TPM 预抢等本地软限流不挡 Sonnet，同时仍能避开刚撞到 Sonnet 429 的账号。
         let mut limited_out: Vec<i64> = Vec::new();
         let candidates: Vec<Account> = accounts
             .into_iter()
@@ -181,6 +184,10 @@ impl AccountService {
                     return false;
                 }
                 if skip_rate_limit_filter {
+                    if !self.limit_store.sonnet_available(a.id) {
+                        limited_out.push(a.id);
+                        return false;
+                    }
                     return true;
                 }
                 let availability = self.limit_store.availability(a.id);
