@@ -89,10 +89,22 @@ fn merge_anthropic_beta(required: &str, incoming: &str) -> String {
 /// - `OAUTH_BETA_HEADER`   : 始终（claudeAISubscriber）
 /// - `INTERLEAVED_THINKING`: firstParty 规则 `!claude-3-*`
 /// - `REDACT_THINKING`     : 需 ISP 支持（等价于 `!claude-3-*`，默认交互式会话）
+/// 剥离 model id 末尾的 `[1m]` 后缀（Claude Code CLI 用于标记 1M 上下文模式）。
+/// 返回 (去后缀的 model_id, 是否命中 1m)。Anthropic API 不认 `[1m]`，必须剥离并
+/// 另外发 `context-1m-2025-08-07` beta。
+fn strip_1m_suffix(model_id: &str) -> (&str, bool) {
+    if let Some(stripped) = model_id.strip_suffix("[1m]") {
+        (stripped, true)
+    } else {
+        (model_id, false)
+    }
+}
+
 /// - `CONTEXT_MANAGEMENT`  : Claude 4+ 模型（opus-4/sonnet-4/haiku-4）
 /// - `PROMPT_CACHING_SCOPE`: 始终（firstParty）
 pub fn compute_betas_for_model(model_id: &str) -> Vec<&'static str> {
-    let lower = model_id.to_lowercase();
+    let (base, needs_1m) = strip_1m_suffix(model_id);
+    let lower = base.to_lowercase();
     let is_haiku = lower.contains("haiku");
     let is_claude3 = lower.contains("claude-3-");
     // firstParty: ISP 等价于 !claude-3-*（源码 betas.ts:107）
@@ -117,6 +129,9 @@ pub fn compute_betas_for_model(model_id: &str) -> Vec<&'static str> {
         out.push("context-management-2025-06-27");
     }
     out.push("prompt-caching-scope-2026-01-05");
+    if needs_1m {
+        out.push("context-1m-2025-08-07");
+    }
     out
 }
 
@@ -306,6 +321,19 @@ impl Rewriter {
     ) {
         let env = self.parse_env(account);
         let prompt_env = self.parse_prompt_env(account);
+
+        // Claude Code CLI 把 `[1m]` 后缀当作"启用 1M 上下文"的标记；Anthropic API 不认，
+        // 必须剥离成真实 model id（beta header 里另加 `context-1m-2025-08-07`）。
+        if let Some(obj) = body.as_object_mut() {
+            if let Some(m) = obj.get("model").and_then(|v| v.as_str()) {
+                if let Some(stripped) = m.strip_suffix("[1m]") {
+                    obj.insert(
+                        "model".into(),
+                        serde_json::Value::String(stripped.to_string()),
+                    );
+                }
+            }
+        }
 
         if client_type == ClientType::ClaudeCode {
             // 替换模式
@@ -1235,7 +1263,7 @@ fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod beta_tests {
-    use super::compute_betas_for_model;
+    use super::{compute_betas_for_model, strip_1m_suffix};
 
     fn contains(set: &[&str], s: &str) -> bool {
         set.iter().any(|x| *x == s)
@@ -1301,5 +1329,28 @@ mod beta_tests {
         let a = compute_betas_for_model("claude-sonnet-4-5");
         let b = compute_betas_for_model("claude-sonnet-4-5");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn model_id_with_1m_suffix_adds_context_1m_beta() {
+        let b = compute_betas_for_model("claude-sonnet-4-6[1m]");
+        assert!(contains(&b, "context-1m-2025-08-07"));
+        // 基础 beta 按剥离后的 base model id（claude-sonnet-4-6）计算
+        assert!(contains(&b, "context-management-2025-06-27"));
+        assert!(contains(&b, "claude-code-20250219"));
+    }
+
+    #[test]
+    fn model_id_without_1m_suffix_omits_context_1m_beta() {
+        let b = compute_betas_for_model("claude-sonnet-4-5-20250929");
+        assert!(!contains(&b, "context-1m-2025-08-07"));
+    }
+
+    #[test]
+    fn strip_1m_suffix_helper() {
+        assert_eq!(strip_1m_suffix("claude-sonnet-4-6[1m]"), ("claude-sonnet-4-6", true));
+        assert_eq!(strip_1m_suffix("claude-opus-4-7[1m]"), ("claude-opus-4-7", true));
+        assert_eq!(strip_1m_suffix("claude-sonnet-4-5-20250929"), ("claude-sonnet-4-5-20250929", false));
+        assert_eq!(strip_1m_suffix("[1m]"), ("", true));
     }
 }
