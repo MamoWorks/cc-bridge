@@ -183,12 +183,20 @@ impl GatewayService {
             (vec![], vec![])
         };
 
+        // Sonnet 请求旁路：让本地限流状态不拦截 Sonnet，由 Anthropic 自己拒。
+        // 约定：request body 里 model 字段含 "sonnet"（大小写不敏感）即认定为 Sonnet。
+        let is_sonnet_request = body_map
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(|m| m.to_ascii_lowercase().contains("sonnet"))
+            .unwrap_or(false);
+
         // 黏性透传策略：429 不再 retry 其它账号（换号会 bust prompt cache，成本爆炸）。
         // 本次请求拿到 429 → 包装成通用错误 body 返回；后续并发请求由 absorb_headers
         // 更新的 state.status / rate_limited_until 让 selector 自然避开此账号。
         let account = match self
             .account_svc
-            .select_account(&session_hash, &blocked_ids, &allowed_ids)
+            .select_account(&session_hash, &blocked_ids, &allowed_ids, is_sonnet_request)
             .await
         {
             Ok(a) => a,
