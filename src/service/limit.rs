@@ -765,10 +765,18 @@ fn bottleneck_limit_until(state: &LimitState) -> Option<DateTime<Utc>> {
 fn judge_availability(state: &LimitState, model_class: ModelClass) -> Availability {
     // ---- 账号级门（对两模型一致）----
     if state.status == Some(UnifiedStatus::Rejected) {
-        return Availability::Unavailable {
-            reason: "上游已拒绝（status=rejected）".into(),
-            until: state.reset_at,
-        };
+        // 仅当 reset_at 仍在未来时才视为有效拒绝（与下面 5h / 7d gate 对齐）。
+        // reset_at 过期或缺失则当作 stale 标记，落到后续 gate 判断：否则一旦被
+        // 上游标过 Rejected，selector 会持续过滤该账号 → 没有流量进入
+        // absorb_headers → state.status 永远没机会被新响应覆写，形成死锁。
+        if let Some(reset_at) = state.reset_at {
+            if reset_at > Utc::now() {
+                return Availability::Unavailable {
+                    reason: "上游已拒绝（status=rejected）".into(),
+                    until: Some(reset_at),
+                };
+            }
+        }
     }
     if let Some(until) = state.rate_limited_until {
         if until > Utc::now() {
@@ -1123,12 +1131,42 @@ mod tests {
     }
 
     #[test]
-    fn availability_rejected_is_unavailable() {
+    fn availability_rejected_with_future_reset_is_unavailable() {
+        // status=Rejected + reset_at 在未来 → Unavailable
         let state = LimitState {
             status: Some(UnifiedStatus::Rejected),
+            reset_at: Some(Utc::now() + chrono::Duration::hours(1)),
             ..Default::default()
         };
-        assert!(!judge_availability(&state, ModelClass::Opus).is_available());
+        match judge_availability(&state, ModelClass::Opus) {
+            Availability::Unavailable { until, .. } => assert!(until.is_some()),
+            Availability::Available => panic!("应 Unavailable"),
+        }
+    }
+
+    #[test]
+    fn availability_rejected_with_past_reset_is_available() {
+        // status=Rejected 但 reset_at 已经过去 → 视为 stale，应当 Available。
+        // 回归用例：huiguan-yewu 2026-05-18 死锁场景 —— 5h 窗口在 reset 之后
+        // selector 仍然把账号当作 Rejected 过滤，因没有流量来覆写 status。
+        let state = LimitState {
+            status: Some(UnifiedStatus::Rejected),
+            reset_at: Some(Utc::now() - chrono::Duration::hours(1)),
+            ..Default::default()
+        };
+        assert!(judge_availability(&state, ModelClass::Opus).is_available());
+    }
+
+    #[test]
+    fn availability_rejected_without_reset_is_available() {
+        // status=Rejected 但 reset_at 缺失（上游未带 reset 头）→ 仍按 stale 处理，
+        // 避免在缺信息时永久封禁该账号。
+        let state = LimitState {
+            status: Some(UnifiedStatus::Rejected),
+            reset_at: None,
+            ..Default::default()
+        };
+        assert!(judge_availability(&state, ModelClass::Opus).is_available());
     }
 
     #[test]
@@ -1871,10 +1909,13 @@ mod tests {
     }
 
     /// 账号级 status=Rejected（rep_claim=five_hour 或 seven_day）→ 两模型都封。
+    /// 注：需要带未来 reset_at；缺失 reset_at 时 Rejected 视为 stale（见
+    /// `availability_rejected_without_reset_is_available`）。
     #[test]
     fn account_level_status_rejected_blocks_both_models() {
         let state = LimitState {
             status: Some(UnifiedStatus::Rejected),
+            reset_at: Some(Utc::now() + chrono::Duration::hours(1)),
             ..Default::default()
         };
         assert!(!judge_availability(&state, ModelClass::Opus).is_available());
